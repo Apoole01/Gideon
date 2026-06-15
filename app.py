@@ -197,14 +197,18 @@ ticker_chain['volume'] = pd.to_numeric(ticker_chain['volume'], errors='coerce').
 ticker_chain['open_interest'] = pd.to_numeric(ticker_chain['open_interest'], errors='coerce').fillna(0)
 ticker_chain['iv'] = pd.to_numeric(ticker_chain['iv'], errors='coerce')
 ticker_chain['delta'] = pd.to_numeric(ticker_chain['delta'], errors='coerce')
-ticker_chain['premium'] = ticker_chain['volume'] * ticker_chain['last_price'] * 100
+
+# Premium tracking
+ticker_chain['premium_vol'] = ticker_chain['volume'] * ticker_chain['last_price'] * 100
+ticker_chain['premium_oi'] = ticker_chain['open_interest'] * ticker_chain['last_price'] * 100
 
 available_dates = sorted(ticker_summary['date_str'].unique(), reverse=True)
 selected_date = st.sidebar.selectbox("Select Date Snapshot:", available_dates)
 
 current_chain = ticker_chain[ticker_chain['date_str'] == selected_date]
 current_summary = ticker_summary[ticker_summary['date_str'] == selected_date]
-spot_price = current_chain['underlying_price'].iloc[0] if not current_chain.empty and 'underlying_price' in current_chain.columns else 0
+spot_price = current_chain['underlying_price'].iloc[
+    0] if not current_chain.empty and 'underlying_price' in current_chain.columns else 0
 
 company_info = fetch_company_info(selected_ticker)
 days_to_earnings = fetch_days_to_earnings(selected_ticker)
@@ -222,6 +226,10 @@ st.divider()
 ts_sorted = ticker_summary.sort_values('date_str')
 comp_date = selected_date
 ts_20d = ts_sorted[pd.to_datetime(ts_sorted['date_str']) <= pd.to_datetime(comp_date)].tail(20).copy()
+
+# Add daily total OI premium to the summary dataframe to calculate rank
+daily_prem_oi = ticker_chain.groupby('date_str')['premium_oi'].sum().rename('total_prem_oi')
+ts_20d = ts_20d.join(daily_prem_oi, on='date_str', how='left').fillna(0)
 
 if 'call_volume' not in ts_20d.columns:
     ts_20d['call_volume'] = ts_20d['total_volume'] / (1 + ts_20d['put_call_ratio_vol'])
@@ -241,17 +249,22 @@ if row is not None:
     vol_rank = (ts_20d['total_volume'] <= row['total_volume']).mean() * 100
     iv_rank = (ts_20d['oi_weighted_iv'] <= row['oi_weighted_iv']).mean() * 100
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    # Calculate Premium Rank
+    current_prem_val = daily_prem_oi.get(selected_date, 0)
+    prem_rank = (ts_20d['total_prem_oi'] <= current_prem_val).mean() * 100
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("P/C Ratio", f"{row['put_call_ratio_vol']:.2f}")
     c2.metric("Change in OI", f"{oi_change:+.2f}%")
     c3.metric("Vol Rank", f"{vol_rank:.0f}%")
     c4.metric("IV Rank", f"{iv_rank:.0f}%")
-    c5.metric("Earnings", days_to_earnings)
+    c5.metric("Prem Rank", f"{prem_rank:.0f}%")
+    c6.metric("Earnings", days_to_earnings)
 st.divider()
 
 # --- TABS DEFINITION ---
-tab1, tab2, tab3, tab_sector, tab_stealth = st.tabs(
-    ["🌊 Positioning", "📈 Volatility", "📍 Gamma/Delta", "⚖️ Sector Rotation", "🕵️ Accumulation"]
+tab1, tab2, tab3, tab_sector, tab_stealth, tab_heatmap = st.tabs(
+    ["🌊 Positioning", "📈 Volatility", "📍 Gamma/Delta", "⚖️ Sector Rotation", "🕵️ Accumulation", "🌡️ Surface Heatmap"]
 )
 
 # ==========================================
@@ -315,12 +328,19 @@ with tab1:
 
     with col_t2:
         st.subheader("Net Change in Open Interest Trend")
-        oi_chg_dte = st.radio("DTE Scope (ΔOI):",
-                              ["All Exps (Inc. 0DTE)", "Front-Month (7-45 DTE)", "Long-Term (>45 DTE)"],
-                              horizontal=True, label_visibility="collapsed")
+        c_oi_1, c_oi_2 = st.columns([2, 1])
+        with c_oi_1:
+            oi_chg_dte = st.radio("DTE Scope (ΔOI):",
+                                  ["All Exps", "Front-Month (7-45 DTE)", "Long-Term (>45 DTE)", "Specific Expiration"],
+                                  horizontal=True, label_visibility="collapsed")
+        with c_oi_2:
+            sel_oi_exp = render_two_step_selector("oi_chg_exp", sorted(t_chain['expiration'].dropna().unique()),
+                                                  is_multi=False) if oi_chg_dte == "Specific Expiration" else None
 
         df_chg = t_chain.copy()
-        if "Front-Month" in oi_chg_dte:
+        if oi_chg_dte == "Specific Expiration" and sel_oi_exp:
+            df_chg = df_chg[df_chg['expiration'] == sel_oi_exp]
+        elif "Front-Month" in oi_chg_dte:
             df_chg = df_chg[(df_chg['dte'] >= 7) & (df_chg['dte'] <= 45)]
         elif "Long-Term" in oi_chg_dte:
             df_chg = df_chg[df_chg['dte'] > 45]
@@ -355,17 +375,140 @@ with tab1:
     st.divider()
 
     # ==========================================
-    # ROW 2: PIE CHARTS
+    # ROW 2: NEW PREMIUM CHARTS
+    # ==========================================
+    col_p1, col_p2 = st.columns(2)
+    with col_p1:
+        st.subheader("Premium Stack by Expiration (Last x OI)")
+        st.markdown("<span style='font-size:12px; color:#A0AEC0;'>Excludes Monday & Wednesday Expirations</span>",
+                    unsafe_allow_html=True)
+
+        # 1. Get valid expirations (Exclude Mon=0, Wed=2)
+        all_exps = sorted(ticker_chain['expiration'].dropna().unique())
+        valid_exps = [e for e in all_exps if pd.to_datetime(e).weekday() not in [0, 2]]
+
+        # 2. Find closest index to selected date
+        future_exps = [e for e in valid_exps if e >= selected_date]
+        idx = valid_exps.index(future_exps[0]) if future_exps else len(valid_exps)
+
+        # 3. Slice 10 backward, 10 forward
+        start_idx = max(0, idx - 10)
+        end_idx = min(len(valid_exps), idx + 10)
+        target_exps = valid_exps[start_idx:end_idx]
+
+        # 4. Gather Data
+        prem_stack_data = []
+        for e in target_exps:
+            e_df = ticker_chain[(ticker_chain['expiration'] == e) & (ticker_chain['date_str'] <= selected_date)]
+            if not e_df.empty:
+                last_date = e_df['date_str'].max()  # Gets selected_date for future, or actual last trading day for past
+                day_df = e_df[e_df['date_str'] == last_date]
+                c_prem = day_df[day_df['side'] == 'CALL']['premium_oi'].sum()
+                p_prem = day_df[day_df['side'] == 'PUT']['premium_oi'].sum()
+                prem_stack_data.append(
+                    {'Expiration': e, 'Call Premium': c_prem, 'Put Premium': p_prem, 'Total': c_prem + p_prem})
+
+        df_prem_stack = pd.DataFrame(prem_stack_data)
+
+        if not df_prem_stack.empty:
+            df_prem_stack['put_call_ratio'] = np.where(df_prem_stack['Call Premium'] > 0,
+                                                       df_prem_stack['Put Premium'] / df_prem_stack['Call Premium'], 0)
+
+            fig_prem_stack = go.Figure()
+            fig_prem_stack.add_trace(
+                go.Bar(x=df_prem_stack['Expiration'], y=df_prem_stack['Call Premium'], name='Call Premium ($)',
+                       marker_color='#00CC96', opacity=0.8, yaxis='y1'))
+            fig_prem_stack.add_trace(
+                go.Bar(x=df_prem_stack['Expiration'], y=df_prem_stack['Put Premium'], name='Put Premium ($)',
+                       marker_color='#EF553B', opacity=0.8, yaxis='y1'))
+            fig_prem_stack.add_trace(
+                go.Scatter(x=df_prem_stack['Expiration'], y=df_prem_stack['put_call_ratio'], name='P/C Ratio (Premium)',
+                           mode='lines+markers', line=dict(color='#FECB52', width=2), yaxis='y2'))
+
+            fig_prem_stack.update_layout(template='plotly_dark', barmode='stack',
+                                         yaxis=dict(title="Notional Premium ($)", side='left'),
+                                         yaxis2=dict(title="P/C Premium Ratio", overlaying='y', side='right',
+                                                     range=[0, 3]),
+                                         legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"),
+                                         margin=dict(t=10, b=10, l=10, r=10), height=400,
+                                         xaxis=dict(type='category', categoryorder='category ascending'))
+
+            # FIXED: Calculate numerical categorical placement for the Snapshot Date line
+            plot_exps = df_prem_stack['Expiration'].tolist()
+            past_exps = [e for e in plot_exps if e <= selected_date]
+            if past_exps:
+                x_idx = plot_exps.index(past_exps[-1])
+                x_pos = x_idx if past_exps[-1] == selected_date else x_idx + 0.5
+            else:
+                x_pos = -0.5
+
+            # Add the vertical line using the calculated float index instead of the raw string
+            fig_prem_stack.add_vline(x=x_pos, line_dash="solid", line_color="white", opacity=0.7,
+                                     annotation_text="Snapshot Date")
+
+            st.plotly_chart(fig_prem_stack, use_container_width=True)
+
+    with col_p2:
+        st.subheader("10-Day Leading Premium History")
+        sel_hist_exp = render_two_step_selector("prem_hist_exp", sorted(ticker_chain['expiration'].dropna().unique()),
+                                                is_multi=False)
+
+        if sel_hist_exp:
+            # Filter the chain for the selected expiration, ending at the selected date, get last 10 days
+            hist_df = ticker_chain[
+                (ticker_chain['expiration'] == sel_hist_exp) & (ticker_chain['date_str'] <= selected_date)].copy()
+
+            if not hist_df.empty:
+                valid_dates = sorted(hist_df['date_str'].unique())[-10:]
+                hist_df = hist_df[hist_df['date_str'].isin(valid_dates)]
+
+                # Aggregate Call/Put Premium and grab the spot price for each day
+                hist_agg_c = hist_df[hist_df['side'] == 'CALL'].groupby('date_str')['premium_oi'].sum().rename(
+                    'Call Premium')
+                hist_agg_p = hist_df[hist_df['side'] == 'PUT'].groupby('date_str')['premium_oi'].sum().rename(
+                    'Put Premium')
+                hist_spot = hist_df.groupby('date_str')['underlying_price'].first()
+
+                hist_merged = pd.concat([hist_agg_c, hist_agg_p, hist_spot], axis=1).fillna(0).reset_index()
+
+                fig_hist = make_subplots(specs=[[{"secondary_y": True}]])
+                fig_hist.add_trace(go.Bar(x=hist_merged['date_str'], y=hist_merged['Call Premium'], name="Call Premium",
+                                          marker_color='#00CC96'), secondary_y=False)
+                fig_hist.add_trace(
+                    go.Bar(x=hist_merged['date_str'], y=-hist_merged['Put Premium'], name="Put Premium (Inverted)",
+                           marker_color='#EF553B'), secondary_y=False)
+                fig_hist.add_trace(
+                    go.Scatter(x=hist_merged['date_str'], y=hist_merged['underlying_price'], name="Spot Price",
+                               mode='lines+markers', line=dict(color='white', width=2)), secondary_y=True)
+
+                fig_hist.update_layout(template='plotly_dark', barmode='relative', hovermode='x unified',
+                                       yaxis=dict(title="Notional Premium ($)", showgrid=False),
+                                       yaxis2=dict(title="Spot Price", showgrid=False),
+                                       legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"),
+                                       margin=dict(t=10, b=10, l=10, r=10), height=400,
+                                       xaxis=dict(type='category', categoryorder='category ascending'))
+                st.plotly_chart(fig_hist, use_container_width=True)
+            else:
+                st.warning("No historical data available for this expiration on or before the selected date.")
+
+    st.divider()
+    # ==========================================
+    # ROW 3: PIE CHARTS
     # ==========================================
     c_pie1, c_pie2, c_pie_ctrl = st.columns([2, 2, 1])
     with c_pie_ctrl:
         st.subheader("Pie Controls")
         pie_unit = st.radio("Display Unit:", ["Notional Value ($)", "Contract Amount"], index=0)
-        pie_scope = st.radio("DTE Scope (Pies):", ["All Exps", "Front-Month (7-45 DTE)", "Long-Term (>45 DTE)"])
+        pie_scope = st.radio("DTE Scope (Pies):",
+                             ["All Exps", "Front-Month (7-45 DTE)", "Long-Term (>45 DTE)", "Specific Expiration"])
+        sel_pie_exp = render_two_step_selector("pie_exp", sorted(current_chain['expiration'].dropna().unique()),
+                                               is_multi=False) if pie_scope == "Specific Expiration" else None
 
     df_pie = current_chain.copy()
     if not df_pie.empty:
-        if "Front-Month" in pie_scope:
+        if pie_scope == "Specific Expiration" and sel_pie_exp:
+            df_pie = df_pie[df_pie['expiration'] == sel_pie_exp]
+        elif "Front-Month" in pie_scope:
             df_pie = df_pie[(df_pie['dte'] >= 7) & (df_pie['dte'] <= 45)]
         elif "Long-Term" in pie_scope:
             df_pie = df_pie[df_pie['dte'] > 45]
@@ -402,19 +545,29 @@ with tab1:
     st.divider()
 
     # ==========================================
-    # ROW 3: VWKS & STRIKE PROFILE
+    # ROW 4: VWKS & STRIKE PROFILE
     # ==========================================
     col_m1, col_m2 = st.columns(2)
     with col_m1:
         st.subheader("VWKS Trend (Center of Mass)")
-        vwks_scope = st.radio("VWKS Scope:", ["All Exps (Inc. 0DTE)", "Front-Month (7-45 DTE)", "Long-Term (>45 DTE)"],
-                              horizontal=True, label_visibility="collapsed", key="vwks_radio")
+        c_vw_r, c_vw_s = st.columns([2, 1])
+        with c_vw_r:
+            vwks_scope = st.radio("VWKS Scope:",
+                                  ["All Exps", "Front-Month (7-45 DTE)", "Long-Term (>45 DTE)", "Specific Expiration"],
+                                  horizontal=True, label_visibility="collapsed", key="vwks_radio")
+        with c_vw_s:
+            sel_vwks_exp = render_two_step_selector("vwks_exp", sorted(t_chain['expiration'].dropna().unique()),
+                                                    is_multi=False) if vwks_scope == "Specific Expiration" else None
+
         if not t_chain.empty:
             df_vw = t_chain.copy()
-            if "Front-Month" in vwks_scope:
+            if vwks_scope == "Specific Expiration" and sel_vwks_exp:
+                df_vw = df_vw[df_vw['expiration'] == sel_vwks_exp]
+            elif "Front-Month" in vwks_scope:
                 df_vw = df_vw[(df_vw['dte'] >= 7) & (df_vw['dte'] <= 45)]
             elif "Long-Term" in vwks_scope:
                 df_vw = df_vw[df_vw['dte'] > 45]
+
             df_vw = df_vw[df_vw['underlying_price'] > 0]
             if not df_vw.empty:
                 df_vw['vwks_num'] = ((df_vw['strike'] / df_vw['underlying_price']) - 1) * df_vw['volume']
@@ -471,171 +624,12 @@ with tab1:
     else:
         today_str, yest_str = selected_date, None
 
-    # ==========================================
-    # ROW 4: OI SURFACE STACKED BAR CHART
-    # ==========================================
-    st.subheader("Institutional OI Surface (Δ OI vs Yesterday)")
-
-    c_hm_side, c_hm_exps, c_hm_filter = st.columns([1, 1, 2])
-    with c_hm_side:
-        hm_side = st.radio("Target Chain:", ["CALL", "PUT"], horizontal=True, label_visibility="collapsed")
-    with c_hm_filter:
-        hm_min_oi = st.slider("Noise Filter (Minimum Absolute Δ OI)", min_value=0, max_value=5000, value=50, step=50,
-                              label_visibility="collapsed")
-
-    if today_str and yest_str:
-        df_today_hm = ticker_chain[ticker_chain['date_str'] == today_str]
-        df_yest_hm = ticker_chain[ticker_chain['date_str'] == yest_str]
-
-        if not df_today_hm.empty and not df_yest_hm.empty:
-            hm_merge = df_today_hm[['expiration', 'strike', 'side', 'open_interest']].merge(
-                df_yest_hm[['expiration', 'strike', 'side', 'open_interest']],
-                on=['expiration', 'strike', 'side'], suffixes=('_today', '_yest')
-            )
-            hm_merge['oi_change'] = hm_merge['open_interest_today'] - hm_merge['open_interest_yest']
-
-            with c_hm_exps:
-                avail_exps = sorted(hm_merge['expiration'].unique()) if not hm_merge.empty else []
-                hm_selected_exps = st.multiselect("Filter Expirations:", avail_exps, placeholder="All Expirations")
-
-            hm_data = hm_merge[hm_merge['side'] == hm_side].copy()
-            hm_data = hm_data[(hm_data['strike'] >= spot_price * 0.7) & (hm_data['strike'] <= spot_price * 1.3)]
-            hm_data = hm_data[hm_data['oi_change'].abs() >= hm_min_oi]
-            if hm_selected_exps: hm_data = hm_data[hm_data['expiration'].isin(hm_selected_exps)]
-
-            if not hm_data.empty:
-                hm_data['Exp_Label'] = hm_data['expiration'].apply(get_exp_label)
-                hm_data = hm_data.sort_values(['strike', 'expiration'])
-
-                fig_hm = px.bar(
-                    hm_data, x='strike', y='oi_change', color='Exp_Label',
-                    custom_data=['Exp_Label'], template='plotly_dark', barmode='relative',
-                    color_discrete_sequence=px.colors.qualitative.Plotly,
-                    labels={'strike': 'Strike Price', 'oi_change': 'Net Δ Open Interest', 'Exp_Label': 'Expiration'}
-                )
-                fig_hm.add_vline(x=spot_price, line_dash="dash", line_color="white", annotation_text="Spot")
-                fig_hm.update_traces(
-                    hovertemplate="<b>Expiration:</b> %{customdata[0]}<br><b>Strike:</b> $%{x}<br><b>Δ OI:</b> %{y:+,d}<extra></extra>")
-                fig_hm.update_layout(
-                    height=500, margin=dict(t=30, b=10, l=10, r=10),
-                    xaxis=dict(title="Strike Price", type='linear'),
-                    yaxis=dict(title="Net Δ Open Interest"),
-                    showlegend=False
-                )
-                st.plotly_chart(fig_hm, use_container_width=True)
-            else:
-                st.info(f"No {hm_side} data passed the filter within 30% of spot price.")
-
-    st.divider()
-
-    # ==========================================
-    # ROW 5: WHALE FLOW TRACKER
-    # ==========================================
-    st.subheader("Whale Flow Radar & Continuation")
-    c_dte, c_vol_oi, c_premium = st.columns(3)
-    with c_dte:
-        whale_dte = st.selectbox("DTE Scope:",
-                                 ["All Exps (Inc. 0DTE)", "Front-Month (7-45 DTE)", "Long-Term (>45 DTE)"],
-                                 label_visibility="collapsed")
-    with c_vol_oi:
-        filter_vol_oi = st.checkbox("Vol > OI (New Positioning)", value=True)
-    with c_premium:
-        filter_premium = st.checkbox("Premium > $500k", value=True)
-
-
-    def get_whale_flow(df, target_date):
-        if df.empty or target_date is None: return pd.DataFrame()
-        temp_df = df.copy()
-        if "Front-Month" in whale_dte:
-            temp_df = temp_df[(temp_df['dte'] >= 7) & (temp_df['dte'] <= 45)]
-        elif "Long-Term" in whale_dte:
-            temp_df = temp_df[temp_df['dte'] > 45]
-        if filter_vol_oi: temp_df = temp_df[temp_df['volume'] > temp_df['open_interest']]
-        if filter_premium: temp_df = temp_df[temp_df['premium'] >= 500000]
-        return temp_df
-
-
-    t_tracker, t_continuation = st.tabs(["Today's Live Whales", "Yesterday's Continuation (T+1)"])
-    today_df = ticker_chain[ticker_chain['date_str'] == today_str]
-    yest_df = ticker_chain[ticker_chain['date_str'] == yest_str] if yest_str else pd.DataFrame()
-
-
-    def style_today_side(row):
-        is_bullish = (row['Side'] == 'CALL' and 'Net Buy' in row['Position']) or (
-                    row['Side'] == 'PUT' and 'Net Sell' in row['Position'])
-        bg_color = 'background-color: rgba(0, 204, 150, 0.2)' if is_bullish else 'background-color: rgba(239, 85, 59, 0.2)'
-        return [bg_color if col == 'Side' else '' for col in row.index]
-
-
-    def style_cont_side(row):
-        is_bullish = (row['Side'] == 'CALL' and 'Buy Open' in row['Position']) or (
-                    row['Side'] == 'PUT' and 'Sell Open' in row['Position'])
-        is_bearish = (row['Side'] == 'CALL' and 'Sell Open' in row['Position']) or (
-                    row['Side'] == 'PUT' and 'Buy Open' in row['Position'])
-        if is_bullish:
-            bg_color = 'background-color: rgba(0, 204, 150, 0.2)'
-        elif is_bearish:
-            bg_color = 'background-color: rgba(239, 85, 59, 0.2)'
-        else:
-            bg_color = 'background-color: rgba(128, 128, 128, 0.2)'
-        return [bg_color if col == 'Side' else '' for col in row.index]
-
-
-    with t_tracker:
-        whales_today = get_whale_flow(today_df, today_str)
-        if not whales_today.empty:
-            whales_today = whales_today.sort_values(by='premium', ascending=False)
-            if not yest_df.empty:
-                prev_iv_map = yest_df[['expiration', 'strike', 'side', 'iv']].rename(columns={'iv': 'prev_iv'})
-                whales_today = whales_today.merge(prev_iv_map, on=['expiration', 'strike', 'side'], how='left')
-                whales_today['iv_change'] = pd.to_numeric(whales_today['iv'], errors='coerce') - pd.to_numeric(
-                    whales_today['prev_iv'], errors='coerce')
-                whales_today['Position'] = np.where(whales_today['iv_change'] > 0, '🟢 Net Buy',
-                                                    np.where(whales_today['iv_change'] < 0, '🔴 Net Sell',
-                                                             '⚪ Unchanged'))
-            else:
-                whales_today['Position'] = '⚪ Unknown'
-
-            display_today = whales_today[
-                ['side', 'expiration', 'strike', 'Position', 'volume', 'open_interest', 'premium', 'iv']].copy()
-            display_today.columns = ['Side', 'Expiry', 'Strike', 'Position', 'Volume', 'OI', 'Total Premium', 'IV']
-            st.dataframe(display_today.style.format(
-                {'Strike': '${:.2f}', 'Volume': '{:,.0f}', 'OI': '{:,.0f}', 'Total Premium': '${:,.0f}',
-                 'IV': '{:.1%}'}).apply(style_today_side, axis=1), use_container_width=True, hide_index=True)
-
-    with t_continuation:
-        whales_yest = get_whale_flow(yest_df, yest_str)
-        if not whales_yest.empty and not today_df.empty:
-            continuation = pd.merge(whales_yest[['side', 'expiration', 'strike', 'volume', 'open_interest', 'iv']],
-                                    today_df[['side', 'expiration', 'strike', 'open_interest', 'iv']],
-                                    on=['side', 'expiration', 'strike'], suffixes=('_yest', '_today'))
-            if not continuation.empty:
-                continuation['Δ OI'] = continuation['open_interest_today'] - continuation['open_interest_yest']
-                continuation['Hold %'] = (continuation['Δ OI'] / continuation['volume']).clip(lower=0)
-                continuation['Δ IV'] = continuation['iv_today'] - continuation['iv_yest']
-                conditions = [(continuation['Δ OI'] > 0) & (continuation['Δ IV'] > 0),
-                              (continuation['Δ OI'] > 0) & (continuation['Δ IV'] < 0),
-                              (continuation['Δ OI'] < 0) & (continuation['Δ IV'] > 0),
-                              (continuation['Δ OI'] < 0) & (continuation['Δ IV'] < 0)]
-                continuation['Position'] = np.select(conditions,
-                                                     ['🟢 Buy Open', '🔴 Sell Open', '🟡 Buy Close', '⚪ Sell Close'],
-                                                     default='⚖️ Neutral / Rolled')
-                display_cont = continuation.sort_values(by='Δ OI', ascending=False)[
-                    ['side', 'expiration', 'strike', 'Position', 'volume', 'Δ OI', 'Hold %', 'iv_today', 'Δ IV']].copy()
-                display_cont.columns = ['Side', 'Expiry', 'Strike', 'Position', 'Yest Volume', 'Net Δ OI', 'Hold %',
-                                        'Current IV', 'Net Δ IV']
-                st.dataframe(display_cont.style.format(
-                    {'Strike': '${:.2f}', 'Yest Volume': '{:,.0f}', 'Net Δ OI': '{:+,.0f}', 'Hold %': '{:.1%}',
-                     'Current IV': '{:.1%}', 'Net Δ IV': '{:+.2%}'}).bar(subset=['Hold %'], color='#00CC96',
-                                                                         vmax=1.0).text_gradient(
-                    subset=['Net Δ OI', 'Net Δ IV'], cmap='RdYlGn').apply(style_cont_side, axis=1),
-                             use_container_width=True, hide_index=True)
 # ==========================================
 # TAB 2: VOLATILITY
 # ==========================================
 with tab2:
     st.subheader("Omni-Volatility Dynamics (Filtered Scope)")
-    c_mode, c_bar, c_exp = st.columns([1.5, 1.2, 1])
+    c_mode, c_bar, c_exp, c_togg = st.columns([1.5, 1.2, 1, 1])
     with c_mode:
         iv_scope = st.radio("Trend Scope:", ["Front-Month (7-45 DTE)", "Specific Expiration"], horizontal=True,
                             label_visibility="collapsed")
@@ -645,6 +639,9 @@ with tab2:
     with c_exp:
         selected_iv_exp = render_two_step_selector("iv_trend", sorted(ticker_chain['expiration'].dropna().unique()),
                                                    is_multi=False) if iv_scope == "Specific Expiration" else None
+    with c_togg:
+        # NEW: Toggle for <10 Delta wings
+        show_10_delta = st.checkbox("Show <10Δ Wings", value=True)
 
     omni_data, prev_call_oi, prev_put_oi = [], None, None
     for d in ts_20d['date_str'].unique():
@@ -655,8 +652,11 @@ with tab2:
 
         if iv_scope == "Front-Month (7-45 DTE)":
             valid_df = day_df[(day_df['dte'] >= 7) & (day_df['dte'] <= 45)].copy()
-        else:
+        elif selected_iv_exp:
             valid_df = day_df[day_df['expiration'] == selected_iv_exp].copy()
+        else:
+            continue
+
         if valid_df.empty: continue
 
         call_vol, put_vol = valid_df[valid_df['side'] == 'CALL']['volume'].sum(), valid_df[valid_df['side'] == 'PUT'][
@@ -708,10 +708,15 @@ with tab2:
         fig_omni.add_trace(
             go.Bar(x=omni_df['date_str'], y=omni_df[y_put], name=f'Put {bar_mode.split()[0]}', marker_color='#EF553B',
                    opacity=0.3, yaxis='y1', text=omni_df['Put Pct Text'], textposition='inside'))
-        fig_omni.add_trace(go.Scatter(x=omni_df['date_str'], y=omni_df['10Δ Call'], name='<10Δ Call IV', mode='lines',
-                                      line=dict(color='#00FF99', width=1, dash='dashdot'), yaxis='y2', opacity=0.6))
-        fig_omni.add_trace(go.Scatter(x=omni_df['date_str'], y=omni_df['10Δ Put'], name='<10Δ Put IV', mode='lines',
-                                      line=dict(color='#FF3366', width=1, dash='dashdot'), yaxis='y2', opacity=0.6))
+
+        # Apply Toggle for 10 Delta
+        if show_10_delta:
+            fig_omni.add_trace(
+                go.Scatter(x=omni_df['date_str'], y=omni_df['10Δ Call'], name='<10Δ Call IV', mode='lines',
+                           line=dict(color='#00FF99', width=1, dash='dashdot'), yaxis='y2', opacity=0.6))
+            fig_omni.add_trace(go.Scatter(x=omni_df['date_str'], y=omni_df['10Δ Put'], name='<10Δ Put IV', mode='lines',
+                                          line=dict(color='#FF3366', width=1, dash='dashdot'), yaxis='y2', opacity=0.6))
+
         fig_omni.add_trace(go.Scatter(x=omni_df['date_str'], y=omni_df['25Δ Call'], name='25Δ Call IV', mode='lines',
                                       line=dict(color='#00664A', width=2, dash='dot'), yaxis='y2'))
         fig_omni.add_trace(go.Scatter(x=omni_df['date_str'], y=omni_df['25Δ Put'], name='25Δ Put IV', mode='lines',
@@ -795,7 +800,6 @@ with tab2:
 
         if smile_exps:
             smile_df = current_chain[current_chain['expiration'].isin(smile_exps)].copy()
-            # Trim to +/- 20% of Spot to keep the smile chart readable
             smile_df = smile_df[(smile_df['strike'] >= spot_price * 0.8) & (smile_df['strike'] <= spot_price * 1.2)]
 
             if not smile_df.empty:
@@ -811,26 +815,20 @@ with tab2:
                     c = colors[i % len(colors)]
                     formatted_label = get_exp_label(exp)
 
-                    # Plot Volume Bars (Primary Y-Axis)
                     fig_smile.add_trace(
                         go.Bar(x=exp_data['strike'], y=exp_data['volume'], name=f'Vol {formatted_label}',
-                               marker_color=c,
-                               opacity=0.35, yaxis='y1', offsetgroup=str(i))
+                               marker_color=c, opacity=0.35, yaxis='y1', offsetgroup=str(i))
                     )
-                    # Plot IV Line (Secondary Y-Axis)
                     fig_smile.add_trace(
                         go.Scatter(x=exp_data['strike'], y=exp_data['iv_pct'], name=f'IV {formatted_label}',
                                    mode='lines+markers', line=dict(color=c, width=2), yaxis='y2')
                     )
 
                 fig_smile.update_layout(
-                    title="Strike Liquidity vs. Implied Volatility (Smile)",
-                    template='plotly_dark',
-                    barmode='group',
+                    title="Strike Liquidity vs. Implied Volatility (Smile)", template='plotly_dark', barmode='group',
                     yaxis=dict(title='Volume', side='left', showgrid=False),
                     yaxis2=dict(title='Implied Volatility (%)', side='right', overlaying='y', showgrid=True),
-                    hovermode='x unified',
-                    legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"),
+                    hovermode='x unified', legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"),
                     margin=dict(t=40, b=10, l=10, r=10)
                 )
                 fig_smile.add_vline(x=spot_price, line_dash="dash", line_color="white", annotation_text="Spot")
@@ -844,7 +842,6 @@ with tab2:
     # ==========================================
     st.subheader("IV Term Structure (Contango vs Backwardation)")
 
-    # --- UI CONTROLS ---
     c_ts_mode, c_ts_metric, c_ts_filter = st.columns([2, 1.5, 1])
     with c_ts_mode:
         ts_mode = st.radio("Term Structure View:",
@@ -871,34 +868,26 @@ with tab2:
                 calls, puts = exp_df[exp_df['side'] == 'CALL'], exp_df[exp_df['side'] == 'PUT']
                 d25_c_iv = calls[(calls['delta'] >= 0.20) & (calls['delta'] <= 0.30)]['iv'].mean()
                 d25_p_iv = puts[(puts['delta'] <= -0.20) & (puts['delta'] >= -0.30)]['iv'].mean()
-
-                # --- NEW: Calculate Calls & Puts for both Volume and OI ---
                 c_oi, p_oi = calls['open_interest'].sum(), puts['open_interest'].sum()
                 c_vol, p_vol = calls['volume'].sum(), puts['volume'].sum()
 
                 ts_data.append({
-                    'Expiration': exp,
-                    'ATM IV': atm_iv * 100 if pd.notna(atm_iv) else np.nan,
+                    'Expiration': exp, 'ATM IV': atm_iv * 100 if pd.notna(atm_iv) else np.nan,
                     '25Δ Call IV': d25_c_iv * 100 if pd.notna(d25_c_iv) else np.nan,
                     '25Δ Put IV': d25_p_iv * 100 if pd.notna(d25_p_iv) else np.nan,
-                    'Call OI': c_oi, 'Put OI': p_oi,
-                    'Call Vol': c_vol, 'Put Vol': p_vol
+                    'Call OI': c_oi, 'Put OI': p_oi, 'Call Vol': c_vol, 'Put Vol': p_vol
                 })
 
             ts_df = pd.DataFrame(ts_data).dropna(subset=['ATM IV'])
             if not ts_df.empty:
-                # Determine which metric to plot on the bars
                 y_c_bar = 'Call OI' if ts_bar_metric == "Open Interest" else 'Call Vol'
                 y_p_bar = 'Put OI' if ts_bar_metric == "Open Interest" else 'Put Vol'
 
-                # Plot Stacked Bars on secondary Y axis first (so lines render on top)
                 fig_ts.add_trace(go.Bar(x=ts_df['Expiration'], y=ts_df[y_c_bar], name=f'Call {ts_bar_metric}',
                                         marker_color='#00CC96', opacity=0.25, yaxis='y2'))
                 fig_ts.add_trace(
                     go.Bar(x=ts_df['Expiration'], y=ts_df[y_p_bar], name=f'Put {ts_bar_metric}', marker_color='#EF553B',
                            opacity=0.25, yaxis='y2'))
-
-                # Plot IV Lines
                 fig_ts.add_trace(
                     go.Scatter(x=ts_df['Expiration'], y=ts_df['ATM IV'], name='ATM IV', mode='lines+markers',
                                line=dict(color='#FFFFFF', width=3), yaxis='y1'))
@@ -930,22 +919,16 @@ with tab2:
                     exp_df['strike_dist'] = (exp_df['strike'] - d_spot).abs()
                     atm_iv = exp_df[exp_df['strike'] == exp_df.loc[exp_df['strike_dist'].idxmin(), 'strike']][
                         'iv'].mean()
-
-                    # --- NEW: Calculate Calls & Puts for both Volume and OI ---
                     calls, puts = exp_df[exp_df['side'] == 'CALL'], exp_df[exp_df['side'] == 'PUT']
-                    c_oi, p_oi = calls['open_interest'].sum(), puts['open_interest'].sum()
-                    c_vol, p_vol = calls['volume'].sum(), puts['volume'].sum()
 
                     d_ts_data.append({
-                        'Expiration': exp,
-                        'ATM IV': atm_iv * 100 if pd.notna(atm_iv) else np.nan,
-                        'Call OI': c_oi, 'Put OI': p_oi,
-                        'Call Vol': c_vol, 'Put Vol': p_vol
+                        'Expiration': exp, 'ATM IV': atm_iv * 100 if pd.notna(atm_iv) else np.nan,
+                        'Call OI': calls['open_interest'].sum(), 'Put OI': puts['open_interest'].sum(),
+                        'Call Vol': calls['volume'].sum(), 'Put Vol': puts['volume'].sum()
                     })
 
                 d_ts_df = pd.DataFrame(d_ts_data).dropna(subset=['ATM IV'])
                 if not d_ts_df.empty:
-                    # Only plot the background bars for the 'Today' slice so the past lines don't clutter the background
                     if label == 'Today':
                         y_c_bar = 'Call OI' if ts_bar_metric == "Open Interest" else 'Call Vol'
                         y_p_bar = 'Put OI' if ts_bar_metric == "Open Interest" else 'Put Vol'
@@ -962,15 +945,12 @@ with tab2:
                                                 yaxis='y1'))
 
         if len(fig_ts.data) > 0:
-            fig_ts.update_layout(
-                template='plotly_dark',
-                barmode='stack',  # Ensure bars stack rather than group side-by-side
-                hovermode='x unified',
-                legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"),
-                margin=dict(t=30, b=10, l=10, r=10),
-                yaxis=dict(title="Implied Volatility (%)", side='left', showgrid=False),
-                yaxis2=dict(title=f"Total {ts_bar_metric}", side='right', overlaying='y', showgrid=False)
-            )
+            fig_ts.update_layout(template='plotly_dark', barmode='stack', hovermode='x unified',
+                                 legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"),
+                                 margin=dict(t=30, b=10, l=10, r=10),
+                                 yaxis=dict(title="Implied Volatility (%)", side='left', showgrid=False),
+                                 yaxis2=dict(title=f"Total {ts_bar_metric}", side='right', overlaying='y',
+                                             showgrid=False))
             fig_ts.update_xaxes(type='category', categoryorder='category ascending')
             st.plotly_chart(fig_ts, use_container_width=True)
 
@@ -979,23 +959,29 @@ with tab2:
 # ==========================================
 with tab3:
     st.subheader("Gamma Exposure Profile (GEX)")
-    c_g_model, c_g_view, c_g_dte = st.columns(3)
+    c_g_model, c_g_view, c_g_dte, c_g_sel = st.columns([1.2, 1, 1.5, 1])
     with c_g_model:
-        gamma_model = st.radio("Gamma Model:", ["Standard GEX (Call/Put)", "IV-Derived (Flow Proxy)"], horizontal=True,
+        gamma_model = st.radio("Gamma Model:", ["Standard GEX", "Flow Proxy"], horizontal=True,
                                label_visibility="collapsed")
     with c_g_view:
-        gamma_view = st.radio("Display View (Gamma):", ["Net Exposure", "Absolute (Separated)"], horizontal=True,
+        gamma_view = st.radio("Display View (Gamma):", ["Net", "Absolute"], horizontal=True,
                               label_visibility="collapsed")
     with c_g_dte:
         gamma_dte = st.radio("DTE Scope (Gamma):",
-                             ["All Exps (Inc. 0DTE)", "Front-Month (7-45 DTE)", "Long-Term (>45 DTE)"], horizontal=True,
-                             label_visibility="collapsed")
+                             ["All Exps", "Front-Month (7-45 DTE)", "Long-Term (>45 DTE)", "Specific Expiration"],
+                             horizontal=True, label_visibility="collapsed")
+    with c_g_sel:
+        sel_gamma_exp = render_two_step_selector("gamma_exp", sorted(current_chain['expiration'].dropna().unique()),
+                                                 is_multi=False) if gamma_dte == "Specific Expiration" else None
 
     chain_gex = current_chain.copy()
-    if "Front-Month" in gamma_dte:
+    if gamma_dte == "Specific Expiration" and sel_gamma_exp:
+        chain_gex = chain_gex[chain_gex['expiration'] == sel_gamma_exp]
+    elif "Front-Month" in gamma_dte:
         chain_gex = chain_gex[(chain_gex['dte'] >= 7) & (chain_gex['dte'] <= 45)]
     elif "Long-Term" in gamma_dte:
         chain_gex = chain_gex[chain_gex['dte'] > 45]
+
     chain_gex = chain_gex[(chain_gex['strike'] >= spot_price * 0.8) & (chain_gex['strike'] <= spot_price * 1.2)]
 
     if not chain_gex.empty:
@@ -1055,20 +1041,26 @@ with tab3:
     st.divider()
 
     st.subheader("Delta Exposure Profile (DEX)")
-    c_d_view, c_d_dte, _ = st.columns(3)
+    c_d_view, c_d_dte, c_d_sel = st.columns([1, 1.5, 1])
     with c_d_view:
-        delta_view = st.radio("Display View (Delta):", ["Net Exposure", "Absolute (Separated)"], horizontal=True,
+        delta_view = st.radio("Display View (Delta):", ["Net", "Absolute"], horizontal=True,
                               label_visibility="collapsed")
     with c_d_dte:
         delta_dte = st.radio("DTE Scope (Delta):",
-                             ["All Exps (Inc. 0DTE)", "Front-Month (7-45 DTE)", "Long-Term (>45 DTE)"], horizontal=True,
-                             label_visibility="collapsed")
+                             ["All Exps", "Front-Month (7-45 DTE)", "Long-Term (>45 DTE)", "Specific Expiration"],
+                             horizontal=True, label_visibility="collapsed")
+    with c_d_sel:
+        sel_delta_exp = render_two_step_selector("delta_exp", sorted(current_chain['expiration'].dropna().unique()),
+                                                 is_multi=False) if delta_dte == "Specific Expiration" else None
 
     chain_dex = current_chain.copy()
-    if "Front-Month" in delta_dte:
+    if delta_dte == "Specific Expiration" and sel_delta_exp:
+        chain_dex = chain_dex[chain_dex['expiration'] == sel_delta_exp]
+    elif "Front-Month" in delta_dte:
         chain_dex = chain_dex[(chain_dex['dte'] >= 7) & (chain_dex['dte'] <= 45)]
     elif "Long-Term" in delta_dte:
         chain_dex = chain_dex[chain_dex['dte'] > 45]
+
     chain_dex = chain_dex[(chain_dex['strike'] >= spot_price * 0.8) & (chain_dex['strike'] <= spot_price * 1.2)]
 
     if not chain_dex.empty:
@@ -1094,6 +1086,8 @@ with tab3:
                             yaxis_title="Notional Delta Exposure ($)", hovermode='x unified',
                             legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"), margin=dict(b=80))
         st.plotly_chart(fig_d, use_container_width=True)
+
+
 # ==========================================
 # CACHED SECTOR ENGINE
 # ==========================================
@@ -1102,7 +1096,11 @@ def process_sector_data(df, timeframe_str, c_date):
     sec = df[df['ticker'].isin(list(SECTOR_MAP.keys()))].copy()
     if sec.empty: return sec
 
-    sec['date_str'] = sec['timestamp'].astype(str).str[:10]
+    # NEW: Strictly filter out Weekends (Saturday=5, Sunday=6)
+    sec['timestamp_dt'] = pd.to_datetime(sec['timestamp'])
+    sec = sec[sec['timestamp_dt'].dt.weekday < 5].copy()
+
+    sec['date_str'] = sec['timestamp_dt'].dt.strftime('%Y-%m-%d')
     sec['date_dt'] = pd.to_datetime(sec['date_str'])
     sec['exp_dt'] = pd.to_datetime(sec['expiration'])
     sec['dte'] = (sec['exp_dt'] - sec['date_dt']).dt.days
@@ -1231,110 +1229,6 @@ with tab_sector:
                                           xaxis=dict(showticklabels=False), yaxis_title="VWKS %")
                         st.plotly_chart(fig, use_container_width=True)
 
-
-# ==========================================
-# CACHED SCANNER ENGINE
-# ==========================================
-@st.cache_data(ttl=1800)
-def run_global_scanners(df_raw, d_curr, d_1, d_2, scan_dte):
-    df_r = df_raw.copy()
-    df_r['date_str'] = df_r['timestamp'].astype(str).str[:10]
-    df_r = df_r[df_r['date_str'].isin([d_curr, d_1, d_2])]
-
-    df_r['underlying_price'] = pd.to_numeric(df_r['underlying_price'], errors='coerce')
-    df_r['strike'] = pd.to_numeric(df_r['strike'], errors='coerce')
-    df_r['volume'] = pd.to_numeric(df_r['volume'], errors='coerce').fillna(0)
-    df_r['open_interest'] = pd.to_numeric(df_r['open_interest'], errors='coerce').fillna(0)
-    df_r['iv'] = pd.to_numeric(df_r['iv'], errors='coerce')
-    df_r['delta'] = pd.to_numeric(df_r['delta'], errors='coerce')
-    df_r['last_price'] = pd.to_numeric(df_r['last_price'], errors='coerce').fillna(0)
-    df_r['dte'] = (pd.to_datetime(df_r['expiration']) - pd.to_datetime(df_r['date_str'])).dt.days
-    df_r['strike_dist'] = (df_r['strike'] - df_r['underlying_price']).abs()
-
-    df_f = df_r.copy()
-    if scan_dte == "0DTE":
-        df_f = df_r[df_r['dte'] == 0]
-    elif "Front-Month" in scan_dte:
-        df_f = df_r[(df_r['dte'] >= 7) & (df_r['dte'] <= 45)]
-    elif "Long-Term" in scan_dte:
-        df_f = df_r[df_r['dte'] > 45]
-
-    df_f['vwks_num'] = ((df_f['strike'] / df_f['underlying_price']) - 1) * df_f['volume']
-    vwks_pivot = df_f.groupby(['ticker', 'date_str']).apply(
-        lambda g: (g['vwks_num'].sum() / g['volume'].sum() * 100) if g['volume'].sum() > 0 else np.nan).unstack()
-
-    idx_atm = df_f.groupby(['ticker', 'date_str', 'expiration'])['strike_dist'].idxmin()
-    atm_opts = df_f.loc[idx_atm]
-    atm_iv_pivot = atm_opts.groupby(['ticker', 'date_str'])['iv'].mean().unstack()
-
-    spot_pivot = df_f.groupby(['ticker', 'date_str'])['underlying_price'].first().unstack()
-    vol_pivot = df_f.groupby(['ticker', 'date_str'])['volume'].sum().unstack()
-
-    df_f['oi_x_iv'] = df_f['open_interest'] * df_f['iv']
-    oi_iv_pivot = df_f.groupby(['ticker', 'date_str']).apply(
-        lambda g: g['oi_x_iv'].sum() / g['open_interest'].sum() if g['open_interest'].sum() > 0 else np.nan).unstack()
-
-    df_c_f = df_f[df_f['date_str'] == d_curr].copy()
-    df_c_f['oi_notional'] = df_c_f['open_interest'] * df_c_f['last_price'] * 100
-    df_c_unfiltered = df_r[df_r['date_str'] == d_curr].copy()
-
-    s1, s2, s3, s4, s5, s6 = [], [], [], [], [], []
-    all_tickers = df_f['ticker'].unique()
-
-    for t in all_tickers:
-        # Scan 1
-        atm_c, atm_p = atm_iv_pivot.get((t, d_curr)), atm_iv_pivot.get((t, d_2))
-        oi_c, oi_p = oi_iv_pivot.get((t, d_curr)), oi_iv_pivot.get((t, d_2))
-        if pd.notna(atm_c) and pd.notna(atm_p) and pd.notna(oi_c) and pd.notna(oi_p):
-            if atm_c <= atm_p and oi_c > oi_p: s1.append(
-                {'Ticker': t, 'Δ ATM IV': atm_c - atm_p, 'Δ OI-W IV': oi_c - oi_p})
-
-        # Scan 2
-        v0, v1, v2 = vwks_pivot.get((t, d_curr)), vwks_pivot.get((t, d_1)), vwks_pivot.get((t, d_2))
-        s0, s1_sp, s2_sp = spot_pivot.get((t, d_curr)), spot_pivot.get((t, d_1)), spot_pivot.get((t, d_2))
-        if all(pd.notna([v0, v1, v2, s0, s1_sp, s2_sp])):
-            if (max(s0, s1_sp, s2_sp) / min(s0, s1_sp, s2_sp) <= 1.05) and (v0 > v1 > v2):
-                s2.append({'Ticker': t, 'Spot Change': (s0 / s2_sp) - 1, 'Latest VWKS': v0})
-
-        # Scan 3
-        vol0, vol1 = vol_pivot.get((t, d_curr)), vol_pivot.get((t, d_1))
-        if all(pd.notna([vol0, vol1, v0, v1])) and vol1 > 0:
-            if (vol0 > 1.5 * vol1) and (v0 > v1):
-                s3.append({'Ticker': t, 'Vol Spike': f"{(vol0 / vol1):.1f}x", 'Δ VWKS': v0 - v1})
-
-    # Scan 4
-    c_not, p_not = df_c_f[df_c_f['side'] == 'CALL'].groupby('ticker')['oi_notional'].sum(), \
-    df_c_f[df_c_f['side'] == 'PUT'].groupby('ticker')['oi_notional'].sum()
-    for t in all_tickers:
-        cn, pn = c_not.get(t, 0), p_not.get(t, 0)
-        tot = cn + pn
-        if tot > 1000000:
-            if cn / tot > 0.8:
-                s4.append({'Ticker': t, 'Bias': '🟢 Call Heavy', '% Share': cn / tot})
-            elif pn / tot > 0.8:
-                s4.append({'Ticker': t, 'Bias': '🔴 Put Heavy', '% Share': pn / tot})
-
-    # Scan 5
-    c25 = df_c_f[(df_c_f['side'] == 'CALL') & (df_c_f['delta'].between(0.2, 0.3))].groupby('ticker')['iv'].mean()
-    p25 = df_c_f[(df_c_f['side'] == 'PUT') & (df_c_f['delta'].between(-0.3, -0.2))].groupby('ticker')['iv'].mean()
-    for t in all_tickers:
-        civ, piv = c25.get(t), p25.get(t)
-        if pd.notna(civ) and pd.notna(piv) and civ > piv: s5.append({'Ticker': t, 'Call 25Δ': civ, 'Put 25Δ': piv})
-
-    # Scan 6
-    fm_df = df_c_unfiltered[(df_c_unfiltered['dte'] >= 7) & (df_c_unfiltered['dte'] <= 45)]
-    lm_df = df_c_unfiltered[df_c_unfiltered['dte'] > 90]
-    fm_atm = fm_df.loc[fm_df.groupby('ticker')['strike_dist'].idxmin()].set_index('ticker')[
-        'iv'] if not fm_df.empty else {}
-    lm_atm = lm_df.loc[lm_df.groupby('ticker')['strike_dist'].idxmin()].set_index('ticker')[
-        'iv'] if not lm_df.empty else {}
-    for t in df_c_unfiltered['ticker'].unique():
-        fiv, liv = fm_atm.get(t), lm_atm.get(t)
-        if pd.notna(fiv) and pd.notna(liv) and fiv > liv: s6.append({'Ticker': t, 'Front IV': fiv, 'Back IV': liv})
-
-    return s1, s2, s3, s4, s5, s6
-
-
 # ==========================================
 # TAB 7: STEALTH ACCUMULATION VISUALIZER
 # ==========================================
@@ -1377,10 +1271,10 @@ with tab_stealth:
             skew_spread = ((calls_25 - puts_25) * 100).rename("Skew").reset_index()
             skew_spread['Skew_3D_MA'] = skew_spread['Skew'].rolling(window=3).mean()
 
-            # 3. Calc Urgency Flow (Net Premium)
+            # 3. Calc Urgency Flow (Net Premium) - FIXED: Using premium_vol
             urgent_df = t_hist[(t_hist['volume'] > t_hist['open_interest']) & (t_hist['volume'] > 0)]
-            urg_c = urgent_df[urgent_df['side'] == 'CALL'].groupby('date_str')['premium'].sum()
-            urg_p = urgent_df[urgent_df['side'] == 'PUT'].groupby('date_str')['premium'].sum()
+            urg_c = urgent_df[urgent_df['side'] == 'CALL'].groupby('date_str')['premium_vol'].sum()
+            urg_p = urgent_df[urgent_df['side'] == 'PUT'].groupby('date_str')['premium_vol'].sum()
             urg_net = (urg_c.fillna(0) - urg_p.fillna(0)).rename('Net_Urgency').reset_index()
 
             # Merge into master dataframe for plotting
@@ -1535,8 +1429,9 @@ with tab_stealth:
         c_swing, c_swing_desc = st.columns([2, 1])
         with c_swing:
             swing_df = t_hist[t_hist['dte'].between(7, 45)].copy()
-            s_c = swing_df[swing_df['side'] == 'CALL'].groupby('date_str')['premium'].sum()
-            s_p = swing_df[swing_df['side'] == 'PUT'].groupby('date_str')['premium'].sum()
+            # FIXED: Using premium_vol here as well
+            s_c = swing_df[swing_df['side'] == 'CALL'].groupby('date_str')['premium_vol'].sum()
+            s_p = swing_df[swing_df['side'] == 'PUT'].groupby('date_str')['premium_vol'].sum()
             s_net = (s_c - s_p).rename('Net Premium').reset_index()
 
             fig6 = make_subplots(specs=[[{"secondary_y": True}]])
@@ -1637,3 +1532,146 @@ with tab_stealth:
             st.info("**Expirations Used:** Front (7-45 DTE) vs. Back (45+ DTE).\n\n"
                     "**What to look for:** The green line (Front-Month) crossing completely *above* the red line (Back-Month).\n\n"
                     "**Why it's useful:** Normal markets have higher IV in the back-month because there is more time for unknown events (Contango). When front-month overtakes it, it signifies urgent, price-insensitive sweeping of near-term liquidity.")
+# ==========================================
+# TAB 8: INSTITUTIONAL SURFACE HEATMAP (LADDER)
+# ==========================================
+with tab_heatmap:
+    st.header("🌡️ Options Surface Heatmap")
+    st.markdown("A 3D grid visualizing exposure and flow across the entire matrix of strikes and expirations.")
+
+    # --- CONTROLS ---
+    c_heat_met, c_heat_side, c_heat_dte, c_heat_strike = st.columns([2, 1, 1, 1])
+    with c_heat_met:
+        # NEW: Added Notional Premium metric
+        heat_metric = st.selectbox("Select Display Metric:",
+                                   ["Gamma Exposure (Net GEX)", "Notional Delta (Net DEX)",
+                                    "Notional Premium (Net Prem)", "Total Volume", "Daily Δ Open Interest",
+                                    "Total Open Interest (+ Daily Δ)"],
+                                   label_visibility="collapsed")
+    with c_heat_side:
+        heat_side = st.radio("Side:", ["Both", "Calls Only", "Puts Only"], horizontal=True,
+                             label_visibility="collapsed")
+    with c_heat_dte:
+        heat_max_dte = st.slider("Max DTE Window:", min_value=7, max_value=180, value=45)
+    with c_heat_strike:
+        heat_strike_range = st.slider("Strike Range (+/- % from Spot):", min_value=5, max_value=30, value=15)
+
+    if not current_chain.empty and spot_price > 0:
+        df_heat = current_chain.copy()
+        if heat_side == "Calls Only":
+            df_heat = df_heat[df_heat['side'] == 'CALL']
+        elif heat_side == "Puts Only":
+            df_heat = df_heat[df_heat['side'] == 'PUT']
+
+        df_heat = df_heat[(df_heat['dte'] <= heat_max_dte) &
+                          (df_heat['strike'] >= spot_price * (1 - heat_strike_range / 100)) &
+                          (df_heat['strike'] <= spot_price * (1 + heat_strike_range / 100))].copy()
+
+        dates = sorted(ticker_chain['date_str'].dropna().unique())
+        curr_idx = dates.index(selected_date) if selected_date in dates else 0
+        yest_date = dates[curr_idx - 1] if curr_idx > 0 else None
+
+        if yest_date:
+            df_yest = ticker_chain[ticker_chain['date_str'] == yest_date][
+                ['expiration', 'strike', 'side', 'open_interest']]
+            df_heat = df_heat.merge(df_yest, on=['expiration', 'strike', 'side'], how='left',
+                                    suffixes=('', '_yest')).fillna({'open_interest_yest': 0})
+            df_heat['oi_delta'] = df_heat['open_interest'] - df_heat['open_interest_yest']
+        else:
+            df_heat['oi_delta'] = 0
+
+        # Calculate Selected Metric
+        if heat_metric == "Gamma Exposure (Net GEX)":
+            df_heat['val'] = np.where(df_heat['side'] == 'CALL',
+                                      df_heat['gamma'] * df_heat['open_interest'] * 100 * spot_price,
+                                      -df_heat['gamma'] * df_heat['open_interest'] * 100 * spot_price)
+            df_heat['sub_val'] = 0
+            prefix, is_diverging = "$", True
+
+        elif heat_metric == "Notional Delta (Net DEX)":
+            df_heat['val'] = np.where(df_heat['side'] == 'CALL',
+                                      df_heat['delta'].abs() * df_heat['open_interest'] * 100 * spot_price,
+                                      -df_heat['delta'].abs() * df_heat['open_interest'] * 100 * spot_price)
+            df_heat['sub_val'] = 0
+            prefix, is_diverging = "$", True
+
+        elif heat_metric == "Notional Premium (Net Prem)":
+            # NEW: Premium mapping. Call Premium is positive (+), Put Premium is negative (-)
+            df_heat['val'] = np.where(df_heat['side'] == 'CALL', df_heat['open_interest'] * df_heat['last_price'] * 100,
+                                      -df_heat['open_interest'] * df_heat['last_price'] * 100)
+            df_heat['sub_val'] = 0
+            prefix, is_diverging = "$", True
+
+        elif heat_metric == "Total Volume":
+            df_heat['val'] = df_heat['volume']
+            df_heat['sub_val'] = 0
+            prefix, is_diverging = "", False
+
+        elif heat_metric == "Daily Δ Open Interest":
+            df_heat['val'] = np.where(df_heat['side'] == 'CALL', df_heat['oi_delta'], -df_heat['oi_delta'])
+            df_heat['sub_val'] = 0
+            prefix, is_diverging = "", True
+
+        elif heat_metric == "Total Open Interest (+ Daily Δ)":
+            df_heat['val'] = df_heat['open_interest']
+            df_heat['sub_val'] = df_heat['oi_delta']
+            prefix, is_diverging = "", False
+
+        if not df_heat.empty:
+            agg_heat = df_heat.groupby(['strike', 'expiration'])[['val', 'sub_val']].sum().reset_index()
+
+
+            def format_num(x, pref=""):
+                if pd.isna(x): return ""
+                sign = "-" if x < 0 else ""
+                val = abs(x)
+                if val >= 1_000_000:
+                    return f"{sign}{pref}{val / 1_000_000:.1f}M"
+                elif val >= 1_000:
+                    return f"{sign}{pref}{val / 1_000:.1f}K"
+                else:
+                    return f"{sign}{pref}{val:.0f}"
+
+
+            def generate_cell_text(row):
+                v, sv = row['val'], row['sub_val']
+                if v == 0 and sv == 0: return ""
+                main_str = format_num(v, prefix) if v != 0 else "0"
+                if heat_metric == "Total Open Interest (+ Daily Δ)":
+                    sub_sign = "+" if sv > 0 else ""
+                    sub_str = format_num(sv, "") if sv != 0 else "0"
+                    return f"{main_str} ({sub_sign}{sub_str})"
+                return main_str
+
+
+            agg_heat['text_col'] = agg_heat.apply(generate_cell_text, axis=1)
+
+            pivot_matrix = agg_heat.pivot(index='strike', columns='expiration', values='val').fillna(0).sort_index(
+                ascending=True)
+            text_matrix = agg_heat.pivot(index='strike', columns='expiration', values='text_col').fillna("").sort_index(
+                ascending=True)
+
+            if is_diverging:
+                color_scale = [[0.0, '#5B2C6F'], [0.5, '#1e3a8a'], [1.0, '#00CC96']]
+                zmid = 0
+            else:
+                color_scale = [[0.0, '#1e3a8a'], [1.0, '#00CC96']]
+                zmid = None
+
+            fig_hm = go.Figure(data=go.Heatmap(
+                z=pivot_matrix.values, x=pivot_matrix.columns, y=pivot_matrix.index, text=text_matrix.values,
+                texttemplate="%{text}", colorscale=color_scale, zmid=zmid, showscale=False, xgap=2, ygap=2,
+                hovertemplate="<b>Strike:</b> $%{y}<br><b>Exp:</b> %{x}<br><b>Data:</b> %{text}<extra></extra>"
+            ))
+
+            fig_hm.add_hline(y=spot_price, line_dash="solid", line_color="white", line_width=2, annotation_text="Spot",
+                             annotation_position="left")
+            fig_hm.update_layout(template='plotly_dark', height=850, margin=dict(l=10, r=10, t=30, b=10),
+                                 xaxis=dict(title=None, side='top', tickangle=0, type='category', categoryorder='array',
+                                            categoryarray=pivot_matrix.columns),
+                                 yaxis=dict(title="Strike Price", tickmode='array', tickvals=pivot_matrix.index,
+                                            tickformat=".1f"))
+
+            st.plotly_chart(fig_hm, use_container_width=True)
+        else:
+            st.warning("No data found for this specific DTE and Strike range combination.")
