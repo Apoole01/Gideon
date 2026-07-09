@@ -1132,17 +1132,22 @@ with tab_sector:
 
     sec_chain = process_sector_data(df_chain, global_timeframe, comp_date)
     if not sec_chain.empty:
-        c_metric, c_dte, c_sub = st.columns([1, 1, 1])
+        c_metric, c_dte, c_sub, c_opt = st.columns([1, 1.2, 1, 1.2])
         with c_metric:
-            sector_metric = st.radio("View Metric:", ["Sector Skew (Fear vs Greed)", "Premium Flow (Capital)",
-                                                      "VWKS Trend (Migration)"], horizontal=True,
-                                     label_visibility="collapsed")
+            sector_metric = st.radio("View Metric:", ["Sector Skew (Fear vs Greed)", "Premium Flow (Capital)"],
+                                     horizontal=True, label_visibility="collapsed")
         with c_dte:
-            sector_dte = st.radio("DTE Scope:", ["All Exps", "Front-Month (7-45 DTE)", "Long-Term (>45 DTE)"],
+            sector_dte = st.radio("DTE Scope:",
+                                  ["All Exps", "Short-Term (2-7 DTE)", "Front-Month (7-45 DTE)", "Long-Term (>45 DTE)"],
                                   horizontal=True, label_visibility="collapsed")
+        with c_opt:
+            # FIXED: Updated label to reflect Percentiles
+            show_extremes = st.checkbox("Overlay 3D MA & History (10th/90th %ile)", value=True)
 
         df_sec_f = sec_chain.copy()
-        if "Front-Month" in sector_dte:
+        if "Short-Term" in sector_dte:
+            df_sec_f = df_sec_f[(df_sec_f['dte'] >= 2) & (df_sec_f['dte'] <= 7)]
+        elif "Front-Month" in sector_dte:
             df_sec_f = df_sec_f[(df_sec_f['dte'] >= 7) & (df_sec_f['dte'] <= 45)]
         elif "Long-Term" in sector_dte:
             df_sec_f = df_sec_f[df_sec_f['dte'] > 45]
@@ -1153,6 +1158,7 @@ with tab_sector:
             with c_sub:
                 skew_delta = st.radio("Delta Profile:", ["25 Delta (Inst.)", "<10 Delta (Spec.)"], horizontal=True,
                                       label_visibility="collapsed")
+
             if "25 Delta" in skew_delta:
                 calls = df_sec_f[(df_sec_f['side'] == 'CALL') & (df_sec_f['delta'].between(0.2, 0.3))]
                 puts = df_sec_f[(df_sec_f['side'] == 'PUT') & (df_sec_f['delta'].between(-0.3, -0.2))]
@@ -1162,19 +1168,57 @@ with tab_sector:
 
             skew_df = pd.concat([calls.groupby(['plot_date', 'ticker'])['iv'].mean().rename('call_iv'),
                                  puts.groupby(['plot_date', 'ticker'])['iv'].mean().rename('put_iv')],
-                                axis=1).reset_index()
+                                axis=1).reset_index().sort_values('plot_date')
             skew_df['net_skew'] = (skew_df['put_iv'] - skew_df['call_iv']) * 100
+
+            # Calculate Rolling Trends and 90th/10th Percentile History
+            if show_extremes:
+                skew_df['3D_MA'] = skew_df.groupby('ticker')['net_skew'].transform(
+                    lambda x: x.rolling(3, min_periods=1).mean())
+
+                # FIXED: Replaced standard deviation with rolling quantiles (90% / 10%)
+                skew_df['90th_Pct'] = skew_df.groupby('ticker')['net_skew'].transform(
+                    lambda x: x.rolling(20, min_periods=1).quantile(0.90))
+                skew_df['10th_Pct'] = skew_df.groupby('ticker')['net_skew'].transform(
+                    lambda x: x.rolling(20, min_periods=1).quantile(0.10))
 
             cols = st.columns(4)
             for i, t in enumerate(list(SECTOR_MAP.keys())):
                 t_data = skew_df[skew_df['ticker'] == t]
                 with cols[i % 4]:
                     with st.container(border=True):
-                        fig = px.line(t_data, x='plot_date', y='net_skew', template='plotly_dark',
-                                      title=f"{t} - {SECTOR_MAP.get(t)}")
+                        fig = go.Figure()
+
+                        if show_extremes:
+                            # 1. Plot Background 90th/10th Percentile Channels
+                            fig.add_trace(go.Scatter(x=t_data['plot_date'], y=t_data['90th_Pct'], mode='lines',
+                                                     line=dict(color='rgba(239, 85, 59, 0.3)', width=1, dash='dot'),
+                                                     name='90th %ile (Fear)'))
+                            fig.add_trace(go.Scatter(x=t_data['plot_date'], y=t_data['10th_Pct'], mode='lines',
+                                                     line=dict(color='rgba(0, 204, 150, 0.3)', width=1, dash='dot'),
+                                                     fill='tonexty', fillcolor='rgba(255, 255, 255, 0.05)',
+                                                     name='10th %ile (Greed)'))
+                            # 2. Plot the fast 3D MA trend
+                            fig.add_trace(
+                                go.Scatter(x=t_data['plot_date'], y=t_data['3D_MA'], mode='lines', name='3D MA Skew',
+                                           line=dict(color='#FECB52', width=2)))
+                            # 3. Dim the raw noisy daily skew into the background
+                            fig.add_trace(
+                                go.Scatter(x=t_data['plot_date'], y=t_data['net_skew'], mode='lines', name='Raw Skew',
+                                           line=dict(color='rgba(255, 255, 255, 0.3)', width=1)))
+                        else:
+                            # Standard view
+                            fig.add_trace(
+                                go.Scatter(x=t_data['plot_date'], y=t_data['net_skew'], mode='lines', name='Skew',
+                                           line=dict(color='#00CC96', width=2)))
+
                         fig.add_hline(y=0, line_width=1, line_color="white", opacity=0.3)
-                        fig.update_layout(height=250, margin=dict(l=10, r=10, t=30, b=10), xaxis_title=None,
-                                          yaxis_title="Skew %", xaxis=dict(showticklabels=False))
+
+                        fig.update_layout(title=f"{t} - {SECTOR_MAP.get(t)}", template='plotly_dark', height=250,
+                                          margin=dict(l=10, r=10, t=30, b=10), showlegend=False,
+                                          xaxis=dict(showticklabels=False, type='category',
+                                                     categoryorder='category ascending'),
+                                          yaxis_title="Skew %", hovermode='x unified')
                         st.plotly_chart(fig, use_container_width=True)
 
         elif "Premium" in sector_metric:
@@ -1189,6 +1233,21 @@ with tab_sector:
             prem_df = pd.concat([c_prem, p_prem], axis=1).fillna(0).reset_index().sort_values('plot_date')
             prem_df['net_period'] = prem_df['call_prem'] - prem_df['put_prem']
 
+            # Calculate Rolling Trends and 90th/10th Percentile History
+            if show_extremes:
+                prem_df['net_3D_MA'] = prem_df.groupby('ticker')['net_period'].transform(
+                    lambda x: x.rolling(3, min_periods=1).mean())
+                prem_df['call_3D_MA'] = prem_df.groupby('ticker')['call_prem'].transform(
+                    lambda x: x.rolling(3, min_periods=1).mean())
+                prem_df['put_3D_MA'] = prem_df.groupby('ticker')['put_prem'].transform(
+                    lambda x: x.rolling(3, min_periods=1).mean())
+
+                # FIXED: Replaced standard deviation with rolling quantiles (90% / 10%) specifically for Net Period Flow
+                prem_df['90th_Pct'] = prem_df.groupby('ticker')['net_period'].transform(
+                    lambda x: x.rolling(20, min_periods=1).quantile(0.90))
+                prem_df['10th_Pct'] = prem_df.groupby('ticker')['net_period'].transform(
+                    lambda x: x.rolling(20, min_periods=1).quantile(0.10))
+
             cols = st.columns(4)
             for i, t in enumerate(list(SECTOR_MAP.keys())):
                 t_data = prem_df[prem_df['ticker'] == t]
@@ -1196,37 +1255,36 @@ with tab_sector:
                     with st.container(border=True):
                         fig = go.Figure()
                         if "Net" in prem_view:
-                            fig.add_trace(go.Bar(x=t_data['plot_date'], y=t_data['net_period'],
-                                                 marker_color=np.where(t_data['net_period'] >= 0, '#00CC96',
-                                                                       '#EF553B')))
+                            fig.add_trace(go.Bar(x=t_data['plot_date'], y=t_data['net_period'], name='Net Prem',
+                                                 marker_color=np.where(t_data['net_period'] >= 0,
+                                                                       'rgba(0, 204, 150, 0.6)',
+                                                                       'rgba(239, 85, 59, 0.6)')))
+                            if show_extremes:
+                                fig.add_trace(go.Scatter(x=t_data['plot_date'], y=t_data['net_3D_MA'], mode='lines',
+                                                         name='3D MA Flow', line=dict(color='#FECB52', width=2)))
+                                fig.add_trace(go.Scatter(x=t_data['plot_date'], y=t_data['90th_Pct'], mode='lines',
+                                                         line=dict(color='rgba(0, 204, 150, 0.5)', width=1, dash='dot'),
+                                                         name='90th %ile Net Long'))
+                                fig.add_trace(go.Scatter(x=t_data['plot_date'], y=t_data['10th_Pct'], mode='lines',
+                                                         line=dict(color='rgba(239, 85, 59, 0.5)', width=1, dash='dot'),
+                                                         name='10th %ile Net Short'))
                         else:
                             fig.add_trace(go.Bar(x=t_data['plot_date'], y=t_data['call_prem'], name="Calls",
-                                                 marker_color='#00CC96'))
+                                                 marker_color='rgba(0, 204, 150, 0.6)'))
                             fig.add_trace(go.Bar(x=t_data['plot_date'], y=-t_data['put_prem'], name="Puts",
-                                                 marker_color='#EF553B'))
+                                                 marker_color='rgba(239, 85, 59, 0.6)'))
+                            if show_extremes:
+                                fig.add_trace(go.Scatter(x=t_data['plot_date'], y=t_data['call_3D_MA'], mode='lines',
+                                                         name='3D Call MA', line=dict(color='#00CC96', width=2)))
+                                fig.add_trace(go.Scatter(x=t_data['plot_date'], y=-t_data['put_3D_MA'], mode='lines',
+                                                         name='3D Put MA', line=dict(color='#EF553B', width=2)))
                             fig.update_layout(barmode='relative')
+
                         fig.update_layout(title=f"{t} - {SECTOR_MAP.get(t)}", template='plotly_dark', height=250,
                                           margin=dict(l=10, r=10, t=30, b=10), showlegend=False,
-                                          xaxis=dict(showticklabels=False), yaxis_title="$ Prem")
-                        st.plotly_chart(fig, use_container_width=True)
-
-        elif "VWKS" in sector_metric:
-            df_vw = df_sec_f[df_sec_f['underlying_price'] > 0].copy()
-            df_vw['vwks_num'] = ((df_vw['strike'] / df_vw['underlying_price']) - 1) * df_vw['volume']
-            vwks_agg = df_vw.groupby(['ticker', 'plot_date']).agg(num=('vwks_num', 'sum'),
-                                                                  den=('volume', 'sum')).reset_index()
-            vwks_agg['vwks'] = (vwks_agg['num'] / vwks_agg['den']) * 100
-
-            cols = st.columns(4)
-            for i, t in enumerate(list(SECTOR_MAP.keys())):
-                t_data = vwks_agg[vwks_agg['ticker'] == t]
-                with cols[i % 4]:
-                    with st.container(border=True):
-                        fig = px.line(t_data, x='plot_date', y='vwks', template='plotly_dark',
-                                      title=f"{t} - {SECTOR_MAP.get(t)}")
-                        fig.add_hline(y=0, line_width=1, line_color="white", opacity=0.3)
-                        fig.update_layout(height=250, margin=dict(l=10, r=10, t=30, b=10),
-                                          xaxis=dict(showticklabels=False), yaxis_title="VWKS %")
+                                          xaxis=dict(showticklabels=False, type='category',
+                                                     categoryorder='category ascending'),
+                                          yaxis_title="$ Prem", hovermode='x unified')
                         st.plotly_chart(fig, use_container_width=True)
 
 # ==========================================
@@ -1236,302 +1294,282 @@ with tab_stealth:
     st.header("🕵️ Stealth Accumulation Radar")
     st.markdown("Visualizing leading indicators of institutional positioning before underlying price breakouts.")
 
-    # Isolate the last 30 days of data for the trend charts
-    hist_dates = sorted(ticker_chain['date_str'].unique())[-30:]
-    t_hist = ticker_chain[ticker_chain['date_str'].isin(hist_dates)].copy()
-
-    if t_hist.empty:
-        st.warning("Insufficient historical data to render accumulation trends.")
+    # Dynamic lookback slider (Defaults to the most recent 40 trading days)
+    all_dates = sorted(ticker_chain['date_str'].unique())
+    if len(all_dates) == 0:
+        st.warning("No historical data available.")
     else:
-        # Pre-calculate base metrics
-        t_hist['strike_dist'] = (t_hist['strike'] - t_hist['underlying_price']).abs()
-        spot_hist = t_hist.groupby('date_str')['underlying_price'].first()
+        default_start = all_dates[-40] if len(all_dates) >= 40 else all_dates[0]
+        default_end = all_dates[-1]
 
-        # ==========================================
-        # 1. THE MASTER ACCUMULATION RADAR (OVERLAY)
-        # ==========================================
-        st.divider()
-        st.subheader("1. The Master Accumulation Radar")
-        c_master, c_master_desc = st.columns([2.5, 1])
-        with c_master:
-            # 1. Calc 3D MA VWKS
-            df_vwks = t_hist[(t_hist['side'] == 'CALL') & (t_hist['dte'].between(7, 45))].copy()
-            df_vwks['vwks_num'] = df_vwks['strike'] * df_vwks['volume']
-            agg_vwks = df_vwks.groupby('date_str').apply(
+        start_date, end_date = st.select_slider(
+            "Select Global Accumulation Window Range:",
+            options=all_dates,
+            value=(default_start, default_end)
+        )
+
+        # Slice dataset globally based on user interactive window selection
+        t_hist = ticker_chain[(ticker_chain['date_str'] >= start_date) & (ticker_chain['date_str'] <= end_date)].copy()
+
+        if t_hist.empty:
+            st.warning("Insufficient historical data inside selected date window to render trends.")
+        else:
+            # 0. Global Pre-calculations for accurate smoothing and percentiles
+            global_spot = ticker_chain.groupby('date_str')['underlying_price'].first().reset_index()
+            global_spot['Spot_3D_MA'] = global_spot['underlying_price'].rolling(window=3, min_periods=1).mean()
+            spot_ma_dict = dict(zip(global_spot['date_str'], global_spot['Spot_3D_MA']))
+
+            t_hist['strike_dist'] = (t_hist['strike'] - t_hist['underlying_price']).abs()
+            spot_hist = t_hist.groupby('date_str')['underlying_price'].first()
+
+            # Calculate the static 90-Day Percentile Bands for the New Scatter Chart
+            past_dates = [d for d in all_dates if d <= end_date]
+            dates_90 = past_dates[-90:] if len(past_dates) >= 90 else past_dates
+
+            df_90 = ticker_chain[(ticker_chain['date_str'].isin(dates_90)) & (ticker_chain['side'] == 'CALL') & (
+                ticker_chain['dte'].between(7, 45))].copy()
+            df_90['vwks_num'] = df_90['strike'] * df_90['volume']
+            vwks_90 = df_90.groupby('date_str').apply(
                 lambda x: (x['vwks_num'].sum() / x['volume'].sum()) if x['volume'].sum() > 0 else np.nan).rename(
                 'VWKS').reset_index()
-            agg_vwks['VWKS_3D_MA'] = agg_vwks['VWKS'].rolling(window=3).mean()
+            vwks_90['VWKS_3D_MA'] = vwks_90['VWKS'].rolling(3, min_periods=1).mean()
+            vwks_90['Spot_3D_MA'] = vwks_90['date_str'].map(spot_ma_dict)
+            vwks_90['gap_pct'] = ((vwks_90['VWKS_3D_MA'] - vwks_90['Spot_3D_MA']) / vwks_90['Spot_3D_MA']) * 100
 
-            # 2. Calc 3D MA Skew
-            df_skew = t_hist[(t_hist['dte'].between(7, 60)) & (t_hist['iv'] > 0) & (t_hist['iv'] < 2.0)]
-            calls_25 = df_skew[(df_skew['side'] == 'CALL') & (df_skew['delta'].between(0.2, 0.3))].groupby('date_str')[
-                'iv'].mean()
-            puts_25 = df_skew[(df_skew['side'] == 'PUT') & (df_skew['delta'].between(-0.3, -0.2))].groupby('date_str')[
-                'iv'].mean()
-            skew_spread = ((calls_25 - puts_25) * 100).rename("Skew").reset_index()
-            skew_spread['Skew_3D_MA'] = skew_spread['Skew'].rolling(window=3).mean()
+            # The flat static lines based on 90-day history
+            gap_80th = vwks_90['gap_pct'].quantile(0.80)
+            gap_20th = vwks_90['gap_pct'].quantile(0.20)
 
-            # 3. Calc Urgency Flow (Net Premium) - FIXED: Using premium_vol
-            urgent_df = t_hist[(t_hist['volume'] > t_hist['open_interest']) & (t_hist['volume'] > 0)]
-            urg_c = urgent_df[urgent_df['side'] == 'CALL'].groupby('date_str')['premium_vol'].sum()
-            urg_p = urgent_df[urgent_df['side'] == 'PUT'].groupby('date_str')['premium_vol'].sum()
-            urg_net = (urg_c.fillna(0) - urg_p.fillna(0)).rename('Net_Urgency').reset_index()
+            # ==========================================
+            # 1. THE MASTER ACCUMULATION RADAR (OVERLAY)
+            # ==========================================
+            st.divider()
+            st.subheader("1. The Master Accumulation Radar")
+            c_master, c_master_desc = st.columns([2.5, 1])
+            with c_master:
+                df_vwks = t_hist[(t_hist['side'] == 'CALL') & (t_hist['dte'].between(7, 45))].copy()
+                df_vwks['vwks_num'] = df_vwks['strike'] * df_vwks['volume']
+                agg_vwks = df_vwks.groupby('date_str').apply(
+                    lambda x: (x['vwks_num'].sum() / x['volume'].sum()) if x['volume'].sum() > 0 else np.nan).rename(
+                    'VWKS').reset_index()
+                agg_vwks['VWKS_3D_MA'] = agg_vwks['VWKS'].rolling(window=3, min_periods=1).mean()
 
-            # Merge into master dataframe for plotting
-            master_df = agg_vwks[['date_str', 'VWKS_3D_MA']].merge(skew_spread[['date_str', 'Skew_3D_MA']],
-                                                                   on='date_str', how='outer')
-            master_df = master_df.merge(urg_net[['date_str', 'Net_Urgency']], on='date_str', how='outer').sort_values(
-                'date_str')
+                df_skew = t_hist[(t_hist['dte'].between(7, 60)) & (t_hist['iv'] > 0) & (t_hist['iv'] < 2.0)]
+                calls_25 = \
+                df_skew[(df_skew['side'] == 'CALL') & (df_skew['delta'].between(0.2, 0.3))].groupby('date_str')[
+                    'iv'].mean()
+                puts_25 = \
+                df_skew[(df_skew['side'] == 'PUT') & (df_skew['delta'].between(-0.3, -0.2))].groupby('date_str')[
+                    'iv'].mean()
+                skew_spread = ((calls_25 - puts_25) * 100).rename("Skew").reset_index()
+                skew_spread['Skew_3D_MA'] = skew_spread['Skew'].rolling(window=3, min_periods=1).mean()
 
-            fig1 = go.Figure()
-            # Y3: Background Urgency Bars (hidden axis so it doesn't squash the lines)
-            fig1.add_trace(go.Bar(x=master_df['date_str'], y=master_df['Net_Urgency'], name="Net Urgency ($)",
-                                  marker_color=np.where(master_df['Net_Urgency'] >= 0, 'rgba(0, 204, 150, 0.2)',
-                                                        'rgba(239, 85, 59, 0.2)'), yaxis='y3'))
+                master_df = agg_vwks[['date_str', 'VWKS_3D_MA']].merge(skew_spread[['date_str', 'Skew_3D_MA']],
+                                                                       on='date_str', how='outer').sort_values(
+                    'date_str')
 
-            # Y2: Skew 3D MA
-            fig1.add_trace(
-                go.Scatter(x=master_df['date_str'], y=master_df['Skew_3D_MA'], name="3D MA Skew (%)", mode='lines',
-                           line=dict(color='#FECB52', width=2.5), yaxis='y2'))
+                fig1 = go.Figure()
+                fig1.add_trace(
+                    go.Scatter(x=master_df['date_str'], y=master_df['Skew_3D_MA'], name="3D MA Skew (%)", mode='lines',
+                               line=dict(color='#FECB52', width=2.5), yaxis='y2'))
+                fig1.add_trace(go.Scatter(x=master_df['date_str'], y=master_df['VWKS_3D_MA'], name="3D MA VWKS ($)",
+                                          mode='lines+markers', line=dict(color='#00CC96', width=3), yaxis='y1'))
+                fig1.add_trace(go.Scatter(x=spot_hist.index, y=spot_hist.values, name="Spot Price ($)", mode='lines',
+                                          line=dict(color='white', width=2, dash='dot'), yaxis='y1'))
 
-            # Y1: VWKS 3D MA & Spot Price
-            fig1.add_trace(go.Scatter(x=master_df['date_str'], y=master_df['VWKS_3D_MA'], name="3D MA VWKS ($)",
-                                      mode='lines+markers', line=dict(color='#00CC96', width=3), yaxis='y1'))
-            fig1.add_trace(go.Scatter(x=spot_hist.index, y=spot_hist.values, name="Spot Price ($)", mode='lines',
-                                      line=dict(color='white', width=2, dash='dot'), yaxis='y1'))
+                fig1.update_layout(template='plotly_dark', height=450, margin=dict(l=10, r=10, t=10, b=10),
+                                   hovermode='x unified',
+                                   yaxis=dict(title="Price ($)", side='left', showgrid=False),
+                                   yaxis2=dict(title="Skew (%)", side='right', overlaying='y', showgrid=False),
+                                   legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"))
+                fig1.update_xaxes(type='category', categoryorder='category ascending')
+                st.plotly_chart(fig1, use_container_width=True)
+            with c_master_desc:
+                st.info(
+                    "**Expirations Used:**\n"
+                    "* **VWKS Trend Line:** 7 to 45 DTE\n"
+                    "* **Skew Trend Line:** 7 to 60 DTE\n\n"
+                    "**What to look for:** A \"Dual Alignment.\" Look for instances where BOTH the yellow line (Skew) and the green line (VWKS) diverge and slope upward concurrently while underlying structural asset prices (White Dotted) remain range-bound.\n\n"
+                    "**Why it's useful:** Isolates intense accumulation by cross-checking volume positioning targets against asset options decay pricing patterns directly.")
 
-            fig1.update_layout(
-                template='plotly_dark', height=450, margin=dict(l=10, r=10, t=10, b=10), hovermode='x unified',
-                yaxis=dict(title="Price ($)", side='left', showgrid=False),
-                yaxis2=dict(title="Skew (%)", side='right', overlaying='y', showgrid=False),
-                yaxis3=dict(side='right', overlaying='y', showticklabels=False, showgrid=False),
-                barmode='relative', legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center")
-            )
-            fig1.update_xaxes(type='category', categoryorder='category ascending')
-            st.plotly_chart(fig1, use_container_width=True)
-        with c_master_desc:
-            st.info(
-                "**What to look for:** A \"Triple Alignment.\" You want to see the faint green background bars (Urgency) spike, while BOTH the yellow line (Skew) and the green line (VWKS) start curving upwards while the white line (Spot Price) is flat.\n\n"
-                "**Why it's useful:** Any single metric can be a false positive. But if institutions are paying urgent premium (Bars), targeting higher strikes (VWKS), and driving up the cost of upside tail risk (Skew) all at exactly the same time, the conviction is immense.")
+            # ==========================================
+            # 2. VWKS MIGRATION DIVERGENCE (AREA)
+            # ==========================================
+            st.divider()
+            c_vwks, c_vwks_desc = st.columns([2, 1])
+            with c_vwks:
+                # Map globally smoothed spot and calculate the fully smoothed gap
+                agg_vwks['spot_close'] = agg_vwks['date_str'].map(spot_hist)
+                agg_vwks['spot_3d_ma'] = agg_vwks['date_str'].map(spot_ma_dict)
+                agg_vwks['smooth_gap_pct'] = ((agg_vwks['VWKS_3D_MA'] - agg_vwks['spot_3d_ma']) / agg_vwks[
+                    'spot_3d_ma']) * 100
 
-        # ==========================================
-        # 2. VWKS MIGRATION DIVERGENCE
-        # ==========================================
-        st.divider()
-        c_vwks, c_vwks_desc = st.columns([2, 1])
-        with c_vwks:
-            fig2 = go.Figure()
-            fig2.add_trace(
-                go.Scatter(x=agg_vwks['date_str'], y=agg_vwks['VWKS'], name="Raw Call VWKS ($)", mode='lines',
-                           line=dict(color='rgba(0, 204, 150, 0.4)', width=1)))
-            fig2.add_trace(go.Scatter(x=agg_vwks['date_str'], y=agg_vwks['VWKS_3D_MA'], name="3-Day MA VWKS ($)",
-                                      mode='lines+markers', line=dict(color='#00CC96', width=3)))
-            fig2.add_trace(go.Scatter(x=spot_hist.index, y=spot_hist.values, name="Spot Price ($)", mode='lines',
-                                      line=dict(color='white', width=2, dash='dot')))
+                fig2 = make_subplots(specs=[[{"secondary_y": True}]])
+                fig2.add_trace(
+                    go.Scatter(x=agg_vwks['date_str'], y=agg_vwks['smooth_gap_pct'], name="Dual-Smoothed % Gap",
+                               mode='lines',
+                               line=dict(color='#FECB52', width=1.5), fill='tozeroy',
+                               fillcolor='rgba(254, 203, 82, 0.15)'), secondary_y=True)
+                fig2.add_trace(
+                    go.Scatter(x=agg_vwks['date_str'], y=agg_vwks['VWKS'], name="Raw Call VWKS ($)", mode='lines',
+                               line=dict(color='rgba(0, 204, 150, 0.4)', width=1)), secondary_y=False)
+                fig2.add_trace(go.Scatter(x=agg_vwks['date_str'], y=agg_vwks['VWKS_3D_MA'], name="3-Day MA VWKS ($)",
+                                          mode='lines+markers', line=dict(color='#00CC96', width=3)), secondary_y=False)
+                fig2.add_trace(go.Scatter(x=spot_hist.index, y=spot_hist.values, name="Spot Price ($)", mode='lines',
+                                          line=dict(color='white', width=2, dash='dot')), secondary_y=False)
 
-            fig2.update_layout(title="2. VWKS Migration Divergence (Absolute Strike vs Spot)", template='plotly_dark',
-                               height=350, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified')
-            fig2.update_xaxes(type='category', categoryorder='category ascending')
-            fig2.update_yaxes(title_text="Price ($)")
-            st.plotly_chart(fig2, use_container_width=True)
-        with c_vwks_desc:
-            st.info("**Expirations Used:** 7 to 45 DTE.\n\n"
-                    "**What to look for:** The solid green line (3-Day MA VWKS) resting significantly *above* the white dotted line (Spot Price), and actively stepping higher.\n\n"
-                    "**Why it's useful:** The moving average smooths out daily block trade anomalies. When the smoothed VWKS climbs steadily above the spot price, institutional volume is aggressively building a magnet out-of-the-money.")
+                fig2.update_layout(title="2. VWKS Migration Divergence (Absolute Strike vs Spot)",
+                                   template='plotly_dark',
+                                   height=350, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified')
+                fig2.update_xaxes(type='category', categoryorder='category ascending')
+                fig2.update_yaxes(title_text="Price ($)", secondary_y=False)
+                fig2.update_yaxes(title_text="Gap Scale (%)", secondary_y=True, showgrid=False)
+                st.plotly_chart(fig2, use_container_width=True)
+            with c_vwks_desc:
+                st.info("**Expirations Used:** 7 to 45 DTE.\n\n"
+                        "**What to look for:** The yellow background mountain range expanding (Rubber Band Stretching), followed by it condensing (Rubber Band Snapping).\n\n"
+                        "**Why it's useful:** A widening yellow area shows institutions are aggressively migrating their volume to higher strikes. By smoothing BOTH the spot price and the VWKS, we eliminate daily noise and reveal the true structural tension.")
 
-        # ==========================================
-        # 3. FORWARD SKEW INVERSION
-        # ==========================================
-        st.divider()
-        c_skew, c_skew_desc = st.columns([2, 1])
-        with c_skew:
-            fig3 = make_subplots(specs=[[{"secondary_y": True}]])
-            fig3.add_trace(go.Scatter(x=skew_spread['date_str'], y=skew_spread['Skew'], fill='tozeroy', mode='lines',
-                                      line=dict(color='rgba(0, 204, 150, 0.3)', width=1),
-                                      fillcolor='rgba(0, 204, 150, 0.1)', name='Raw Daily Skew'), secondary_y=False)
-            fig3.add_trace(go.Scatter(x=skew_spread['date_str'], y=skew_spread['Skew_3D_MA'], mode='lines+markers',
-                                      line=dict(color='#00CC96', width=3), name='3-Day MA Skew'), secondary_y=False)
-            fig3.add_trace(go.Scatter(x=spot_hist.index, y=spot_hist.values, name="Spot Price", mode='lines',
-                                      line=dict(color='white', width=2, dash='dot')), secondary_y=True)
+            # ==========================================
+            # 3. ELASTIC BAND OSCILLATOR (NEW SCATTER)
+            # ==========================================
+            st.divider()
+            c_scat, c_scat_desc = st.columns([2, 1])
+            with c_scat:
+                fig3 = make_subplots(specs=[[{"secondary_y": True}]])
 
-            fig3.add_hline(y=0, line_dash="dash", line_color="white", opacity=0.5, secondary_y=False)
-            fig3.update_layout(title="3. Forward Skew Inversion (Call IV - Put IV)", template='plotly_dark', height=350,
-                               margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified')
-            fig3.update_xaxes(type='category', categoryorder='category ascending')
-            fig3.update_yaxes(title_text="Spread Difference (%)", secondary_y=False)
-            fig3.update_yaxes(showgrid=False, secondary_y=True)
-            st.plotly_chart(fig3, use_container_width=True)
-        with c_skew_desc:
-            st.info("**Expirations Used:** 7 to 60 DTE.\n\n"
-                    "**What to look for:** The solid green line (3-Day Moving Average) breaking above the zero line, while the white dotted line (Spot Price) is flat or down.\n\n"
-                    "**Why it's useful:** Raw skew can be jittery. The MA smooths out the noise to reveal the true structural trend. When the smoothed trend flips positive, institutions are persistently paying a massive premium for upside tail risk.")
+                # The Scatter Plot for the Gap
+                fig3.add_trace(go.Scatter(x=agg_vwks['date_str'], y=agg_vwks['smooth_gap_pct'], mode='markers',
+                                          name='Smoothed % Gap', marker=dict(color='#FECB52', size=8, opacity=0.8)),
+                               secondary_y=False)
+                # The Spot Price Line
+                fig3.add_trace(go.Scatter(x=spot_hist.index, y=spot_hist.values, name="Spot Price", mode='lines',
+                                          line=dict(color='white', width=2)), secondary_y=True)
 
-        # ==========================================
-        # 4. URGENCY FLOW VECTOR
-        # ==========================================
-        st.divider()
-        c_urg, c_urg_desc = st.columns([2, 1])
-        with c_urg:
-            urg_agg = pd.concat([urg_c, urg_p], axis=1).fillna(0).reset_index()
-            urg_agg.columns = ['date_str', 'Call Premium', 'Put Premium']
+                # The Static 90-Day Percentile Lines
+                fig3.add_hline(y=gap_80th, line_dash="dash", line_color="rgba(239, 85, 59, 0.8)",
+                               annotation_text="80th %ile (Extreme Stretch)", secondary_y=False)
+                fig3.add_hline(y=gap_20th, line_dash="dash", line_color="rgba(0, 204, 150, 0.8)",
+                               annotation_text="20th %ile (Tension Released)", secondary_y=False)
 
-            fig4 = make_subplots(specs=[[{"secondary_y": True}]])
-            fig4.add_trace(go.Bar(x=urg_agg['date_str'], y=urg_agg['Call Premium'], name="Urgent Call Prem",
-                                  marker_color='#00CC96'), secondary_y=False)
-            fig4.add_trace(go.Bar(x=urg_agg['date_str'], y=-urg_agg['Put Premium'], name="Urgent Put Prem",
-                                  marker_color='#EF553B'), secondary_y=False)
-            fig4.add_trace(go.Scatter(x=spot_hist.index, y=spot_hist.values, name="Spot Price", mode='lines',
-                                      line=dict(color='white', width=2, dash='dot')), secondary_y=True)
+                fig3.update_layout(title="3. VWKS Elastic Band Oscillator (90-Day Percentile Rank)",
+                                   template='plotly_dark',
+                                   height=350, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified')
+                fig3.update_xaxes(type='category', categoryorder='category ascending')
+                fig3.update_yaxes(title_text="Dual-Smoothed Gap (%)", secondary_y=False)
+                fig3.update_yaxes(title_text="Spot Price ($)", showgrid=False, secondary_y=True)
+                st.plotly_chart(fig3, use_container_width=True)
+            with c_scat_desc:
+                st.info("**Expirations Used:** 7 to 45 DTE.\n\n"
+                        "**What to look for:** The yellow dots hitting the red dashed line (80th Percentile) while the white line (Spot Price) is flat or dipping.\n\n"
+                        "**Why it's useful:** The flat lines represent the highest and lowest 20% of gaps over the trailing 90 days. When the scatter dots hit the red line, the 'Elastic Band' is maximally stretched relative to recent history, highly increasing the probability of a spot rally to close the gap.")
 
-            fig4.update_layout(title="4. Urgency Flow Vector (Volume > OI Premium)", template='plotly_dark',
-                               barmode='relative', height=350, margin=dict(l=10, r=10, t=40, b=10),
-                               hovermode='x unified')
-            fig4.update_xaxes(type='category', categoryorder='category ascending')
-            fig4.update_yaxes(title_text="Notional Premium ($)", secondary_y=False)
-            fig4.update_yaxes(showgrid=False, secondary_y=True)
-            st.plotly_chart(fig4, use_container_width=True)
-        with c_urg_desc:
-            st.info("**Expirations Used:** ALL Expirations (including 0DTE).\n\n"
-                    "**What to look for:** Massive green bars occurring while the stock price is flat.\n\n"
-                    "**Why it's useful:** By strictly looking at contracts where Volume exceeds OI, we guarantee we are looking at *new* money, not old money closing positions. Heavy call flow here is pure, urgent accumulation.")
+            # ==========================================
+            # 4. FORWARD SKEW INVERSION
+            # ==========================================
+            st.divider()
+            c_skew, c_skew_desc = st.columns([2, 1])
+            with c_skew:
+                fig4 = make_subplots(specs=[[{"secondary_y": True}]])
+                fig4.add_trace(
+                    go.Scatter(x=skew_spread['date_str'], y=skew_spread['Skew'], fill='tozeroy', mode='lines',
+                               line=dict(color='rgba(0, 204, 150, 0.3)', width=1),
+                               fillcolor='rgba(0, 204, 150, 0.1)', name='Raw Daily Skew'), secondary_y=False)
+                fig4.add_trace(go.Scatter(x=skew_spread['date_str'], y=skew_spread['Skew_3D_MA'], mode='lines+markers',
+                                          line=dict(color='#00CC96', width=3), name='3-Day MA Skew'), secondary_y=False)
+                fig4.add_trace(go.Scatter(x=spot_hist.index, y=spot_hist.values, name="Spot Price", mode='lines',
+                                          line=dict(color='white', width=2, dash='dot')), secondary_y=True)
 
-        # ==========================================
-        # 5. FAR-OTM (<10Δ) DELTA EXPANSION
-        # ==========================================
-        st.divider()
-        c_wings, c_wings_desc = st.columns([2, 1])
-        with c_wings:
-            far_otm = t_hist[(t_hist['side'] == 'CALL') & (t_hist['delta'] > 0) & (t_hist['delta'] <= 0.10)].copy()
-            far_otm['notional_delta'] = far_otm['delta'] * far_otm['open_interest'] * 100 * far_otm['underlying_price']
-            agg_far = far_otm.groupby('date_str')['notional_delta'].sum().reset_index()
+                fig4.add_hline(y=0, line_dash="dash", line_color="white", opacity=0.5, secondary_y=False)
+                fig4.update_layout(title="4. Forward Skew Inversion (Call IV - Put IV)", template='plotly_dark',
+                                   height=350,
+                                   margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified')
+                fig4.update_xaxes(type='category', categoryorder='category ascending')
+                fig4.update_yaxes(title_text="Spread Difference (%)", secondary_y=False)
+                fig4.update_yaxes(showgrid=False, secondary_y=True)
+                st.plotly_chart(fig4, use_container_width=True)
+            with c_skew_desc:
+                st.info("**Expirations Used:** 7 to 60 DTE.\n\n"
+                        "**What to look for:** The solid green line breaking and holding above the zero line threshold while underlying spot price remains structurally unchanged.\n\n"
+                        "**Why it's useful:** Indicates a systematic trend shift wherein institutions pay higher proportional premiums for upside calls relative to downside protection.")
 
-            fig5 = make_subplots(specs=[[{"secondary_y": True}]])
-            fig5.add_trace(go.Bar(x=agg_far['date_str'], y=agg_far['notional_delta'], marker_color='#FECB52',
-                                  name='<10Δ Notional Delta'), secondary_y=False)
-            fig5.add_trace(go.Scatter(x=spot_hist.index, y=spot_hist.values, name="Spot Price", mode='lines',
-                                      line=dict(color='white', width=2, dash='dot')), secondary_y=True)
+            # ==========================================
+            # 5. FAR-OTM (<10Δ) DELTA EXPANSION
+            # ==========================================
+            st.divider()
+            c_wings, c_wings_desc = st.columns([2, 1])
+            with c_wings:
+                far_otm = t_hist[(t_hist['side'] == 'CALL') & (t_hist['delta'] > 0) & (t_hist['delta'] <= 0.10) & (
+                            t_hist['dte'] > 2)].copy()
+                far_otm['notional_delta'] = far_otm['delta'] * far_otm['open_interest'] * 100 * far_otm[
+                    'underlying_price']
+                agg_far = far_otm.groupby('date_str')['notional_delta'].sum().reset_index()
+                agg_far['Delta_3D_MA'] = agg_far['notional_delta'].rolling(window=3, min_periods=1).mean()
 
-            fig5.update_layout(title="5. Far-OTM (<10Δ) Call Delta Expansion", template='plotly_dark', height=350,
-                               margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified')
-            fig5.update_xaxes(type='category', categoryorder='category ascending')
-            fig5.update_yaxes(title_text="Notional Delta ($)", secondary_y=False)
-            fig5.update_yaxes(showgrid=False, secondary_y=True)
-            st.plotly_chart(fig5, use_container_width=True)
-        with c_wings_desc:
-            st.info("**Expirations Used:** ALL Expirations.\n\n"
-                    "**What to look for:** Sudden, towering yellow bars while the stock is dormant.\n\n"
-                    "**Why it's useful:** <10 Delta options are highly leveraged \"lotto tickets.\" A massive structural buildup here implies deep-pocketed players are positioning for a multi-sigma explosion, often front-running catalysts.")
+                fig5 = make_subplots(specs=[[{"secondary_y": True}]])
+                fig5.add_trace(
+                    go.Bar(x=agg_far['date_str'], y=agg_far['notional_delta'], marker_color='rgba(254, 203, 82, 0.3)',
+                           name='Raw <10Δ Notional Delta'), secondary_y=False)
+                fig5.add_trace(go.Scatter(x=agg_far['date_str'], y=agg_far['Delta_3D_MA'], mode='lines',
+                                          line=dict(color='#FECB52', width=2.5), name='3-Day MA Trend'),
+                               secondary_y=False)
+                fig5.add_trace(go.Scatter(x=spot_hist.index, y=spot_hist.values, name="Spot Price", mode='lines',
+                                          line=dict(color='white', width=2, dash='dot')), secondary_y=True)
 
-        # ==========================================
-        # 6. DTE-STRATIFIED NET PREMIUM SURGE
-        # ==========================================
-        st.divider()
-        c_swing, c_swing_desc = st.columns([2, 1])
-        with c_swing:
-            swing_df = t_hist[t_hist['dte'].between(7, 45)].copy()
-            # FIXED: Using premium_vol here as well
-            s_c = swing_df[swing_df['side'] == 'CALL'].groupby('date_str')['premium_vol'].sum()
-            s_p = swing_df[swing_df['side'] == 'PUT'].groupby('date_str')['premium_vol'].sum()
-            s_net = (s_c - s_p).rename('Net Premium').reset_index()
+                fig5.update_layout(title="5. Far-OTM (<10Δ) Call Delta Expansion", template='plotly_dark', height=350,
+                                   margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified')
+                fig5.update_xaxes(type='category', categoryorder='category ascending')
+                fig5.update_yaxes(title_text="Notional Delta ($)", secondary_y=False)
+                fig5.update_yaxes(showgrid=False, secondary_y=True)
+                st.plotly_chart(fig5, use_container_width=True)
+            with c_wings_desc:
+                st.info("**Expirations Used:** > 2 DTE.\n\n"
+                        "**What to look for:** The solid yellow line (3-Day MA) carving out a new structural upward trend, or individual transparent bars spiking massively *above* the trend line.\n\n"
+                        "**Why it's useful:** The transparent bars show daily outlier spikes, but the solid trend line reveals when institutions are structurally anchoring a multi-day accumulation phase. Filtering out 0-2 DTE removes intra-day gambling noise, leaving pure swing conviction.")
 
-            fig6 = make_subplots(specs=[[{"secondary_y": True}]])
-            fig6.add_trace(go.Bar(x=s_net['date_str'], y=s_net['Net Premium'], name="Net Swing Premium",
-                                  marker_color=np.where(s_net['Net Premium'] >= 0, '#00CC96', '#EF553B')),
-                           secondary_y=False)
-            fig6.add_trace(go.Scatter(x=spot_hist.index, y=spot_hist.values, name="Spot Price", mode='lines',
-                                      line=dict(color='white', width=2, dash='dot')), secondary_y=True)
+            # ==========================================
+            # 6. TERM STRUCTURE BACKWARDATION FLIP
+            # ==========================================
+            st.divider()
+            c_term, c_term_desc = st.columns([2, 1])
+            with c_term:
+                atm_calls = t_hist[(t_hist['side'] == 'CALL') & (t_hist['iv'] > 0) & (t_hist['iv'] < 2.0)].copy()
+                fm_df = atm_calls[atm_calls['dte'].between(7, 45)]
+                bm_df = atm_calls[atm_calls['dte'] > 45]
 
-            fig6.update_layout(title="6. Swing Bucket (7-45 DTE) Net Premium Flow", template='plotly_dark', height=350,
-                               margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified')
-            fig6.update_xaxes(type='category', categoryorder='category ascending')
-            fig6.update_yaxes(title_text="Net Premium ($)", secondary_y=False)
-            fig6.update_yaxes(showgrid=False, secondary_y=True)
-            st.plotly_chart(fig6, use_container_width=True)
-        with c_swing_desc:
-            st.info("**Expirations Used:** 7 to 45 DTE.\n\n"
-                    "**What to look for:** A consistent, multi-day streak of heavy green bars.\n\n"
-                    "**Why it's useful:** By completely removing expirations under 7 days, we filter out day-traders and 0DTE noise. Heavy net call premium in this bucket proves real overnight conviction from swing traders.")
+                if not fm_df.empty:
+                    idx_fm = fm_df.groupby(['date_str', 'expiration'])['strike_dist'].idxmin()
+                    iv_fm = fm_df.loc[idx_fm].groupby('date_str')['iv'].mean() * 100
+                else:
+                    iv_fm = pd.Series(dtype=float)
 
-        # ==========================================
-        # 7. OI-WEIGHTED VS ATM IV DIVERGENCE
-        # ==========================================
-        st.divider()
-        c_ivw, c_ivw_desc = st.columns([2, 1])
-        with c_ivw:
-            df_ivw = t_hist[(t_hist['dte'].between(7, 60)) & (t_hist['iv'] > 0) & (t_hist['iv'] < 2.0)].copy()
-            df_ivw['oi_x_iv'] = df_ivw['open_interest'] * df_ivw['iv']
-            oi_w_iv = df_ivw.groupby('date_str').apply(
-                lambda x: (x['oi_x_iv'].sum() / x['open_interest'].sum()) * 100 if x[
-                                                                                       'open_interest'].sum() > 0 else np.nan)
+                if not bm_df.empty:
+                    idx_bm = bm_df.groupby(['date_str', 'expiration'])['strike_dist'].idxmin()
+                    iv_bm = bm_df.loc[idx_bm].groupby('date_str')['iv'].mean() * 100
+                else:
+                    iv_bm = pd.Series(dtype=float)
 
-            idx_atm = df_ivw.groupby(['date_str', 'expiration'])['strike_dist'].idxmin()
-            atm_iv_daily = df_ivw.loc[idx_atm].groupby('date_str')['iv'].mean() * 100
+                fig6 = make_subplots(specs=[[{"secondary_y": True}]])
+                if not iv_fm.empty: fig6.add_trace(
+                    go.Scatter(x=iv_fm.index, y=iv_fm.values, name="Front-Month (7-45) IV", mode='lines+markers',
+                               line=dict(color='#00CC96', width=3)), secondary_y=False)
+                if not iv_bm.empty: fig6.add_trace(
+                    go.Scatter(x=iv_bm.index, y=iv_bm.values, name="Back-Month (45+) IV", mode='lines',
+                               line=dict(color='#EF553B', width=2)), secondary_y=False)
+                fig6.add_trace(go.Scatter(x=spot_hist.index, y=spot_hist.values, name="Spot Price", mode='lines',
+                                          line=dict(color='white', width=2, dash='dot')), secondary_y=True)
 
-            # Calculate the pure spread/divergence
-            iv_spread = (oi_w_iv - atm_iv_daily).rename("IV_Spread").reset_index()
+                fig6.update_layout(title="6. Term Structure Flip (Backwardation)", template='plotly_dark', height=350,
+                                   margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified')
+                fig6.update_xaxes(type='category', categoryorder='category ascending')
+                fig6.update_yaxes(title_text="Implied Volatility (%)", secondary_y=False)
+                fig6.update_yaxes(showgrid=False, secondary_y=True)
+                st.plotly_chart(fig6, use_container_width=True)
+            with c_term_desc:
+                st.info("**Expirations Used:** Front (7-45 DTE) vs. Back (45+ DTE).\n\n"
+                        "**What to look for:** Front-month curve spikes cross over and invert above the longer-term baseline blocks.\n\n"
+                        "**Why it's useful:** Spotlights short-term premium inflation anomalies that reflect sudden, aggressive localized capital execution.")
 
-            fig7 = make_subplots(specs=[[{"secondary_y": True}]])
-            fig7.add_trace(
-                go.Scatter(x=iv_spread['date_str'], y=iv_spread['IV_Spread'], fill='tozeroy', mode='lines+markers',
-                           line=dict(color='#FECB52', width=2), fillcolor='rgba(254, 203, 82, 0.2)',
-                           name='OI-W vs ATM Spread (%)'), secondary_y=False)
-            fig7.add_trace(go.Scatter(x=spot_hist.index, y=spot_hist.values, name="Spot Price", mode='lines',
-                                      line=dict(color='white', width=2, dash='dot')), secondary_y=True)
-
-            fig7.add_hline(y=0, line_dash="dash", line_color="white", opacity=0.5, secondary_y=False)
-            fig7.update_layout(title="7. OI-Weighted vs ATM IV Divergence", template='plotly_dark', height=350,
-                               margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified')
-            fig7.update_xaxes(type='category', categoryorder='category ascending')
-            fig7.update_yaxes(title_text="Divergence Spread (%)", secondary_y=False)
-            fig7.update_yaxes(showgrid=False, secondary_y=True)
-            st.plotly_chart(fig7, use_container_width=True)
-        with c_ivw_desc:
-            st.info("**Expirations Used:** 7 to 60 DTE.\n\n"
-                    "**What to look for:** The yellow divergence area breaking significantly above the zero line.\n\n"
-                    "**Why it's useful:** A positive value means OI-Weighted IV is mathematically higher than ATM IV. This proves that market makers are aggressively pricing up the far out-of-the-money wings because that is where the real institutional Open Interest is accumulating.")
-
-        # ==========================================
-        # 8. TERM STRUCTURE BACKWARDATION FLIP
-        # ==========================================
-        st.divider()
-        c_term, c_term_desc = st.columns([2, 1])
-        with c_term:
-            atm_calls = t_hist[(t_hist['side'] == 'CALL') & (t_hist['iv'] > 0) & (t_hist['iv'] < 2.0)].copy()
-            fm_df = atm_calls[atm_calls['dte'].between(7, 45)]
-            bm_df = atm_calls[atm_calls['dte'] > 45]
-
-            if not fm_df.empty:
-                idx_fm = fm_df.groupby(['date_str', 'expiration'])['strike_dist'].idxmin()
-                iv_fm = fm_df.loc[idx_fm].groupby('date_str')['iv'].mean() * 100
-            else:
-                iv_fm = pd.Series(dtype=float)
-
-            if not bm_df.empty:
-                idx_bm = bm_df.groupby(['date_str', 'expiration'])['strike_dist'].idxmin()
-                iv_bm = bm_df.loc[idx_bm].groupby('date_str')['iv'].mean() * 100
-            else:
-                iv_bm = pd.Series(dtype=float)
-
-            fig8 = make_subplots(specs=[[{"secondary_y": True}]])
-            if not iv_fm.empty: fig8.add_trace(
-                go.Scatter(x=iv_fm.index, y=iv_fm.values, name="Front-Month (7-45) IV", mode='lines+markers',
-                           line=dict(color='#00CC96', width=3)), secondary_y=False)
-            if not iv_bm.empty: fig8.add_trace(
-                go.Scatter(x=iv_bm.index, y=iv_bm.values, name="Back-Month (45+) IV", mode='lines',
-                           line=dict(color='#EF553B', width=2)), secondary_y=False)
-            fig8.add_trace(go.Scatter(x=spot_hist.index, y=spot_hist.values, name="Spot Price", mode='lines',
-                                      line=dict(color='white', width=2, dash='dot')), secondary_y=True)
-
-            fig8.update_layout(title="8. Term Structure Flip (Backwardation)", template='plotly_dark', height=350,
-                               margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified')
-            fig8.update_xaxes(type='category', categoryorder='category ascending')
-            fig8.update_yaxes(title_text="Implied Volatility (%)", secondary_y=False)
-            fig8.update_yaxes(showgrid=False, secondary_y=True)
-            st.plotly_chart(fig8, use_container_width=True)
-        with c_term_desc:
-            st.info("**Expirations Used:** Front (7-45 DTE) vs. Back (45+ DTE).\n\n"
-                    "**What to look for:** The green line (Front-Month) crossing completely *above* the red line (Back-Month).\n\n"
-                    "**Why it's useful:** Normal markets have higher IV in the back-month because there is more time for unknown events (Contango). When front-month overtakes it, it signifies urgent, price-insensitive sweeping of near-term liquidity.")
 # ==========================================
 # TAB 8: INSTITUTIONAL SURFACE HEATMAP (LADDER)
 # ==========================================
