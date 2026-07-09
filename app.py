@@ -1412,7 +1412,11 @@ with tab_sector:
             if 'Bullish' in str(val): return 'background-color: rgba(0,204,150,0.3); color: #00CC96'
             return ''
 
-        st.dataframe(breakdown.style.applymap(highlight_divergence, subset=['Divergence']), use_container_width=True, hide_index=True)
+        try:
+            styled = breakdown.style.applymap(highlight_divergence, subset=['Divergence'])
+        except AttributeError:
+            styled = breakdown.style.map(highlight_divergence, subset=['Divergence'])
+        st.dataframe(styled, use_container_width=True, hide_index=True)
 
 # ==========================================
 # TAB 7: STEALTH ACCUMULATION VISUALIZER
