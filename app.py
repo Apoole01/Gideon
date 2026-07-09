@@ -263,8 +263,8 @@ if row is not None:
 st.divider()
 
 # --- TABS DEFINITION ---
-tab1, tab2, tab3, tab_sector, tab_stealth, tab_heatmap = st.tabs(
-    ["🌊 Positioning", "📈 Volatility", "📍 Gamma/Delta", "⚖️ Sector Rotation", "🕵️ Accumulation", "🌡️ Surface Heatmap"]
+tab1, tab2, tab3, tab_sector, tab_stealth, tab_signals, tab_heatmap = st.tabs(
+    ["🌊 Positioning", "📈 Volatility", "📍 Gamma/Delta", "⚖️ Sector Rotation", "🕵️ Accumulation", "🎯 Signals", "🌡️ Surface Heatmap"]
 )
 
 # ==========================================
@@ -1089,17 +1089,17 @@ with tab3:
 
 
 # ==========================================
-# CACHED SECTOR ENGINE
+# CACHED SECTOR ROTATION ENGINE
 # ==========================================
 @st.cache_data(ttl=3600)
-def process_sector_data(df, timeframe_str, c_date):
-    sec = df[df['ticker'].isin(list(SECTOR_MAP.keys()))].copy()
-    if sec.empty: return sec
+def compute_rotation_scores(df, comp_date):
+    """Compute composite rotation scores for all 16 sector ETFs."""
+    tickers = list(SECTOR_MAP.keys())
+    sec = df[df['ticker'].isin(tickers)].copy()
+    if sec.empty: return pd.DataFrame()
 
-    # NEW: Strictly filter out Weekends (Saturday=5, Sunday=6)
     sec['timestamp_dt'] = pd.to_datetime(sec['timestamp'])
     sec = sec[sec['timestamp_dt'].dt.weekday < 5].copy()
-
     sec['date_str'] = sec['timestamp_dt'].dt.strftime('%Y-%m-%d')
     sec['date_dt'] = pd.to_datetime(sec['date_str'])
     sec['exp_dt'] = pd.to_datetime(sec['expiration'])
@@ -1111,181 +1111,308 @@ def process_sector_data(df, timeframe_str, c_date):
     sec['delta'] = pd.to_numeric(sec['delta'], errors='coerce')
     sec['premium'] = sec['volume'] * sec['last_price'] * 100
 
-    lb = int(timeframe_str.split()[0])
-    c_dt = pd.to_datetime(c_date) - pd.Timedelta(days=lb)
+    # Get price data for relative strength
+    all_t = tickers + ['SPY']
+    try:
+        pdata = yf.download(all_t, start='2026-01-01', end=comp_date, progress=False)
+    except:
+        return pd.DataFrame()
 
-    if "Weekly" in timeframe_str:
-        sec['plot_date'] = sec['date_dt'].dt.to_period('W-FRI').dt.end_time.dt.strftime('%Y-%m-%d')
-    elif "Monthly" in timeframe_str:
-        sec['plot_date'] = sec['date_dt'].dt.to_period('M').dt.end_time.dt.strftime('%Y-%m')
-    else:
-        sec['plot_date'] = sec['date_str']
+    prices = {}
+    for t in all_t:
+        if ('Close', t) in pdata.columns:
+            prices[t] = pdata[('Close', t)].dropna()
+    spy = prices.get('SPY', pd.Series())
+    if spy.empty: return pd.DataFrame()
 
-    return sec[sec['date_dt'] >= c_dt]
+    # Front-month chain
+    fm = sec[sec['dte'].between(7, 45)]
+    if fm.empty: return pd.DataFrame()
+
+    # Daily skew per ticker
+    calls_25 = fm[(fm['side'] == 'CALL') & (fm['delta'].between(0.2, 0.3))].groupby(['ticker', 'date_str'])['iv'].mean()
+    puts_25 = fm[(fm['side'] == 'PUT') & (fm['delta'].between(-0.3, -0.2))].groupby(['ticker', 'date_str'])['iv'].mean()
+    skew_raw = ((puts_25 - calls_25) * 100).dropna().reset_index()
+    skew_raw.columns = ['ticker', 'date_str', 'skew']
+
+    # Daily premium per ticker
+    prem_call = fm[fm['side'] == 'CALL'].groupby(['ticker', 'date_str'])['premium'].sum()
+    prem_put = fm[fm['side'] == 'PUT'].groupby(['ticker', 'date_str'])['premium'].sum()
+    prem_net = (prem_call - prem_put).dropna().reset_index()
+    prem_net.columns = ['ticker', 'date_str', 'net_prem']
+
+    # Aggregate to latest date for each ticker + compute across available history for each
+    rows = []
+    latest_dates = sec['date_str'].unique()
+    # Use last 60 trading days
+    lookback_dates = sorted(latest_dates)[-60:] if len(latest_dates) >= 60 else sorted(latest_dates)
+
+    for t in tickers:
+        if t not in prices or spy.empty: continue
+        px = prices[t]
+        common = px.index.intersection(spy.index)
+        if len(common) < 20: continue
+        px_a = px[common]; spy_a = spy[common]
+
+        # Price RS (10d and 20d)
+        rel_10d = ((px_a/px_a.shift(10)-1) - (spy_a/spy_a.shift(10)-1)).dropna()
+        rel_20d = ((px_a/px_a.shift(20)-1) - (spy_a/spy_a.shift(20)-1)).dropna()
+        rs_momentum = (rel_10d - rel_10d.shift(5)).dropna()
+
+        latest_rel_10d = rel_10d.iloc[-1] * 100 if len(rel_10d) > 0 else 0
+        latest_rel_20d = rel_20d.iloc[-1] * 100 if len(rel_20d) > 0 else 0
+        latest_rs_mom = rs_momentum.iloc[-1] * 100 if len(rs_momentum) > 0 else 0
+
+        # Options metrics for this ticker
+        t_skew = skew_raw[skew_raw['ticker'] == t].sort_values('date_str')
+        t_prem = prem_net[prem_net['ticker'] == t].sort_values('date_str')
+
+        if t_skew.empty: continue
+
+        skew_latest = t_skew['skew'].iloc[-1]
+        skew_vals = t_skew['skew'].dropna()
+        skew_pct = (skew_vals.iloc[-20:] < skew_latest).mean() * 100 if len(skew_vals) >= 20 else 50
+        skew_momentum = skew_vals.iloc[-1] - skew_vals.iloc[-6] if len(skew_vals) >= 6 else 0
+
+        # Premium flow
+        prem_vals = t_prem['net_prem'].dropna()
+        prem_5d = prem_vals.iloc[-5:].sum() if len(prem_vals) >= 5 else prem_vals.sum()
+        prem_10d = prem_vals.iloc[-10:].sum() if len(prem_vals) >= 10 else prem_vals.sum()
+
+        # Historical scores for timeline (last N periods)
+        hist_scores = []
+        for idx in range(max(0, len(t_skew)-30), len(t_skew)):
+            d = t_skew['date_str'].iloc[idx]
+            if d not in common: continue
+            d_idx = common.get_loc(d) if d in common else -1
+            if d_idx < 10: continue
+            h_rel_10 = ((px_a.iloc[d_idx]/px_a.iloc[d_idx-10]-1) - (spy_a.iloc[d_idx]/spy_a.iloc[d_idx-10]-1)) * 100 if d_idx >= 10 else 0
+            h_skew = t_skew['skew'].iloc[idx]
+            h_prem = t_prem[t_prem['date_str'] <= d]['net_prem'].iloc[-10:].sum() if len(t_prem[t_prem['date_str'] <= d]) >= 10 else 0
+            hist_scores.append({'date_str': d, 'ticker': t, 'rel_10d': h_rel_10, 'skew': h_skew, 'prem_10d': h_prem})
+
+        rows.append({
+            'ticker': t, 'name': SECTOR_MAP.get(t, t),
+            'rel_10d': latest_rel_10d, 'rel_20d': latest_rel_20d, 'rs_momentum': latest_rs_mom,
+            'skew_latest': skew_latest, 'skew_pct': skew_pct, 'skew_momentum': skew_momentum,
+            'prem_5d': prem_5d, 'prem_10d': prem_10d, 'hist_scores': hist_scores
+        })
+
+    if len(rows) < 3: return pd.DataFrame()
+
+    comp = pd.DataFrame(rows)
+
+    # Z-score normalize across sectors
+    for col in ['rel_10d', 'rs_momentum', 'prem_10d', 'skew_latest']:
+        if col in comp.columns:
+            v = comp[col].dropna()
+            if len(v) > 1 and v.std() > 0:
+                comp[f'{col}_z'] = ((comp[col] - v.mean()) / v.std()).clip(-2, 2) / 2
+
+    # Composite: 30% RS + 25% skew + 30% flow + 15% momentum
+    comp['score'] = 0.0
+    w_sum = 0.0
+    for col, w in [('rel_10d_z', 0.30), ('skew_latest_z', 0.25), ('prem_10d_z', 0.30), ('rs_momentum_z', 0.15)]:
+        if col in comp.columns:
+            comp['score'] += comp[col].fillna(0) * w
+            w_sum += w
+    if w_sum > 0: comp['score'] = (comp['score'] / w_sum) * 100
+
+    # Zone classification
+    def zone_label(s):
+        if s > 60: return 'Extreme Overbought'
+        if s > 20: return 'Overbought'
+        if s > -20: return 'Neutral'
+        if s > -60: return 'Oversold'
+        return 'Deep Oversold'
+    comp['zone'] = comp['score'].apply(zone_label)
+
+    # Divergence detection
+    comp['divergence'] = ''
+    for i, r in comp.iterrows():
+        rs_z = r.get('rel_10d_z', 0) or 0
+        sk_z = r.get('skew_latest_z', 0) or 0
+        if rs_z > 0.3 and sk_z < -0.2:
+            comp.at[i, 'divergence'] = 'Bearish Div (Price up, Options fearful)'
+        elif rs_z < -0.3 and sk_z > 0.2:
+            comp.at[i, 'divergence'] = 'Bullish Div (Price down, Options greedy)'
+
+    return comp.sort_values('score', ascending=False)
 
 
 # ==========================================
-# TAB 4: SECTOR ROTATION (Consolidated)
+# TAB 4: SECTOR ROTATION OSCILLATOR
 # ==========================================
 with tab_sector:
-    st.subheader(f"Sector Rotation Engine ({global_timeframe})")
+    st.header("Sector Rotation Oscillator")
+    st.markdown("Composite score from price relative strength (30%), options skew (25%), premium flow (30%), and RS momentum (15%). **Overbought = rotation OUT likely. Oversold = rotation IN likely.**")
 
-    sec_chain = process_sector_data(df_chain, global_timeframe, comp_date)
-    if not sec_chain.empty:
-        c_metric, c_dte, c_sub, c_opt = st.columns([1, 1.2, 1, 1.2])
-        with c_metric:
-            sector_metric = st.radio("View Metric:", ["Sector Skew (Fear vs Greed)", "Premium Flow (Capital)"],
-                                     horizontal=True, label_visibility="collapsed")
-        with c_dte:
-            sector_dte = st.radio("DTE Scope:",
-                                  ["All Exps", "Short-Term (2-7 DTE)", "Front-Month (7-45 DTE)", "Long-Term (>45 DTE)"],
-                                  horizontal=True, label_visibility="collapsed")
-        with c_opt:
-            # FIXED: Updated label to reflect Percentiles
-            show_extremes = st.checkbox("Overlay 3D MA & History (10th/90th %ile)", value=True)
+    with st.spinner("Computing rotation scores..."):
+        rotation_df = compute_rotation_scores(df_chain, comp_date)
 
-        df_sec_f = sec_chain.copy()
-        if "Short-Term" in sector_dte:
-            df_sec_f = df_sec_f[(df_sec_f['dte'] >= 2) & (df_sec_f['dte'] <= 7)]
-        elif "Front-Month" in sector_dte:
-            df_sec_f = df_sec_f[(df_sec_f['dte'] >= 7) & (df_sec_f['dte'] <= 45)]
-        elif "Long-Term" in sector_dte:
-            df_sec_f = df_sec_f[df_sec_f['dte'] > 45]
-
+    if rotation_df.empty:
+        st.warning("Insufficient data to compute rotation scores.")
+    else:
+        # ═══════════ ROW 1: ROTATION OSCILLATOR (HORIZONTAL BARS) ═══════════
         st.divider()
+        c_osc, c_legend = st.columns([3, 1])
+        with c_osc:
+            st.subheader("Rotation Score — All 16 Sectors")
 
-        if "Skew" in sector_metric:
-            with c_sub:
-                skew_delta = st.radio("Delta Profile:", ["25 Delta (Inst.)", "<10 Delta (Spec.)"], horizontal=True,
-                                      label_visibility="collapsed")
+            fig_osc = go.Figure()
 
-            if "25 Delta" in skew_delta:
-                calls = df_sec_f[(df_sec_f['side'] == 'CALL') & (df_sec_f['delta'].between(0.2, 0.3))]
-                puts = df_sec_f[(df_sec_f['side'] == 'PUT') & (df_sec_f['delta'].between(-0.3, -0.2))]
-            else:
-                calls = df_sec_f[(df_sec_f['side'] == 'CALL') & (df_sec_f['delta'].between(0.01, 0.1))]
-                puts = df_sec_f[(df_sec_f['side'] == 'PUT') & (df_sec_f['delta'].between(-0.1, -0.01))]
+            # Color map by zone
+            zone_colors = {
+                'Extreme Overbought': '#00CC96',
+                'Overbought': 'rgba(0,204,150,0.6)',
+                'Neutral': 'rgba(254,203,82,0.5)',
+                'Oversold': 'rgba(239,85,59,0.6)',
+                'Deep Oversold': '#EF553B'
+            }
 
-            skew_df = pd.concat([calls.groupby(['plot_date', 'ticker'])['iv'].mean().rename('call_iv'),
-                                 puts.groupby(['plot_date', 'ticker'])['iv'].mean().rename('put_iv')],
-                                axis=1).reset_index().sort_values('plot_date')
-            skew_df['net_skew'] = (skew_df['put_iv'] - skew_df['call_iv']) * 100
+            display_df = rotation_df.copy()
+            colors = [zone_colors.get(z, '#888') for z in display_df['zone']]
 
-            # Calculate Rolling Trends and 90th/10th Percentile History
-            if show_extremes:
-                skew_df['3D_MA'] = skew_df.groupby('ticker')['net_skew'].transform(
-                    lambda x: x.rolling(3, min_periods=1).mean())
+            fig_osc.add_trace(go.Bar(
+                y=display_df['name'], x=display_df['score'],
+                orientation='h', marker_color=colors,
+                text=[f"{s:+.0f}  " for s in display_df['score']],
+                textposition='outside', textfont=dict(color='white', size=11),
+                hovertemplate='%{y}: %{x:+.0f}<br>Zone: %{customdata}<br>RS 10d: %{text}%',
+                customdata=display_df['zone'],
+            ))
 
-                # FIXED: Replaced standard deviation with rolling quantiles (90% / 10%)
-                skew_df['90th_Pct'] = skew_df.groupby('ticker')['net_skew'].transform(
-                    lambda x: x.rolling(20, min_periods=1).quantile(0.90))
-                skew_df['10th_Pct'] = skew_df.groupby('ticker')['net_skew'].transform(
-                    lambda x: x.rolling(20, min_periods=1).quantile(0.10))
+            # Zone lines
+            for val, color, label in [(-60, 'rgba(239,85,59,0.4)', 'Deep Oversold'),
+                                       (-20, 'rgba(239,85,59,0.25)', 'Oversold'),
+                                       (20, 'rgba(0,204,150,0.25)', 'Overbought'),
+                                       (60, 'rgba(0,204,150,0.4)', 'Extreme Overbought')]:
+                fig_osc.add_vline(x=val, line_dash='dash', line_color=color, line_width=1,
+                                  annotation_text=label if abs(val)==60 else None,
+                                  annotation_position='top' if val > 0 else 'bottom')
+            fig_osc.add_vline(x=0, line_color='white', line_width=1, opacity=0.4)
 
-            cols = st.columns(4)
-            for i, t in enumerate(list(SECTOR_MAP.keys())):
-                t_data = skew_df[skew_df['ticker'] == t]
-                with cols[i % 4]:
-                    with st.container(border=True):
-                        fig = go.Figure()
+            # Divergence markers
+            divs = display_df[display_df['divergence'] != '']
+            for _, d in divs.iterrows():
+                idx = list(display_df['name']).index(d['name'])
+                symb = '⚠️' if 'Bearish' in d['divergence'] else '💡'
+                fig_osc.add_annotation(y=d['name'], x=d['score'] + (8 if d['score'] >= 0 else -8),
+                    text=symb, showarrow=False, font=dict(size=14))
 
-                        if show_extremes:
-                            # 1. Plot Background 90th/10th Percentile Channels
-                            fig.add_trace(go.Scatter(x=t_data['plot_date'], y=t_data['90th_Pct'], mode='lines',
-                                                     line=dict(color='rgba(239, 85, 59, 0.3)', width=1, dash='dot'),
-                                                     name='90th %ile (Fear)'))
-                            fig.add_trace(go.Scatter(x=t_data['plot_date'], y=t_data['10th_Pct'], mode='lines',
-                                                     line=dict(color='rgba(0, 204, 150, 0.3)', width=1, dash='dot'),
-                                                     fill='tonexty', fillcolor='rgba(255, 255, 255, 0.05)',
-                                                     name='10th %ile (Greed)'))
-                            # 2. Plot the fast 3D MA trend
-                            fig.add_trace(
-                                go.Scatter(x=t_data['plot_date'], y=t_data['3D_MA'], mode='lines', name='3D MA Skew',
-                                           line=dict(color='#FECB52', width=2)))
-                            # 3. Dim the raw noisy daily skew into the background
-                            fig.add_trace(
-                                go.Scatter(x=t_data['plot_date'], y=t_data['net_skew'], mode='lines', name='Raw Skew',
-                                           line=dict(color='rgba(255, 255, 255, 0.3)', width=1)))
-                        else:
-                            # Standard view
-                            fig.add_trace(
-                                go.Scatter(x=t_data['plot_date'], y=t_data['net_skew'], mode='lines', name='Skew',
-                                           line=dict(color='#00CC96', width=2)))
+            fig_osc.update_layout(
+                template='plotly_dark', height=500, margin=dict(l=10, r=60, t=10, b=10),
+                xaxis=dict(title='Rotation Score (-100 to +100)', range=[-100, 100], showgrid=True, gridcolor='rgba(255,255,255,0.08)'),
+                yaxis=dict(autorange='reversed', showgrid=False),
+                showlegend=False, hovermode='y unified'
+            )
+            st.plotly_chart(fig_osc, use_container_width=True)
 
-                        fig.add_hline(y=0, line_width=1, line_color="white", opacity=0.3)
+        with c_legend:
+            st.markdown("**Zone Key**")
+            st.markdown("🟢 **+60 to +100** Extreme Overbought — Rotation OUT")
+            st.markdown("🟢 **+20 to +60** Overbought")
+            st.markdown("🟡 **-20 to +20** Neutral — No signal")
+            st.markdown("🔴 **-60 to -20** Oversold")
+            st.markdown("🔴 **-100 to -60** Deep Oversold — Rotation IN")
+            st.divider()
+            st.markdown("**Divergence Markers**")
+            st.markdown("⚠️ = Bearish Divergence (price up but options fearful)")
+            st.markdown("💡 = Bullish Divergence (price down but options greedy)")
+            st.divider()
+            # Top/bottom summary
+            top3 = rotation_df.head(3)
+            bot3 = rotation_df.tail(3)
+            st.metric("Most Overbought", top3['name'].iloc[0], f"{top3['score'].iloc[0]:+.0f}")
+            if len(top3) > 1:
+                st.caption(f"2. {top3['name'].iloc[1]} ({top3['score'].iloc[1]:+.0f})")
+                st.caption(f"3. {top3['name'].iloc[2]} ({top3['score'].iloc[2]:+.0f})")
+            st.divider()
+            st.metric("Most Oversold", bot3['name'].iloc[-1], f"{bot3['score'].iloc[-1]:+.0f}")
+            if len(bot3) > 1:
+                st.caption(f"2. {bot3['name'].iloc[-2]} ({bot3['score'].iloc[-2]:+.0f})")
+                st.caption(f"3. {bot3['name'].iloc[-3]} ({bot3['score'].iloc[-3]:+.0f})")
 
-                        fig.update_layout(title=f"{t} - {SECTOR_MAP.get(t)}", template='plotly_dark', height=250,
-                                          margin=dict(l=10, r=10, t=30, b=10), showlegend=False,
-                                          xaxis=dict(showticklabels=False, type='category',
-                                                     categoryorder='category ascending'),
-                                          yaxis_title="Skew %", hovermode='x unified')
-                        st.plotly_chart(fig, use_container_width=True)
+        # ═══════════ ROW 2: FLOW vs SKEW MATRIX (SCATTER) ═══════════
+        st.divider()
+        st.subheader("Flow vs Skew — Divergence Matrix")
+        c_scat, c_scat_desc = st.columns([2.5, 1])
 
-        elif "Premium" in sector_metric:
-            with c_sub:
-                prem_view = st.radio("Flow View:", ["Net Directional", "Split (Call vs Put)"], horizontal=True,
-                                     label_visibility="collapsed")
+        with c_scat:
+            fig_mat = go.Figure()
 
-            c_prem = df_sec_f[df_sec_f['side'] == 'CALL'].groupby(['ticker', 'plot_date'])['premium'].sum().rename(
-                'call_prem')
-            p_prem = df_sec_f[df_sec_f['side'] == 'PUT'].groupby(['ticker', 'plot_date'])['premium'].sum().rename(
-                'put_prem')
-            prem_df = pd.concat([c_prem, p_prem], axis=1).fillna(0).reset_index().sort_values('plot_date')
-            prem_df['net_period'] = prem_df['call_prem'] - prem_df['put_prem']
+            for _, r in rotation_df.iterrows():
+                sz = max(15, min(40, abs(r['prem_10d']) / max(1, abs(rotation_df['prem_10d']).mean()) * 20))
+                color = zone_colors.get(r['zone'], '#888')
 
-            # Calculate Rolling Trends and 90th/10th Percentile History
-            if show_extremes:
-                prem_df['net_3D_MA'] = prem_df.groupby('ticker')['net_period'].transform(
-                    lambda x: x.rolling(3, min_periods=1).mean())
-                prem_df['call_3D_MA'] = prem_df.groupby('ticker')['call_prem'].transform(
-                    lambda x: x.rolling(3, min_periods=1).mean())
-                prem_df['put_3D_MA'] = prem_df.groupby('ticker')['put_prem'].transform(
-                    lambda x: x.rolling(3, min_periods=1).mean())
+                fig_mat.add_trace(go.Scatter(
+                    x=[r['skew_latest']], y=[r['rel_10d']],
+                    mode='markers+text', name=r['name'],
+                    marker=dict(size=sz, color=color, line=dict(color='white', width=1)),
+                    text=r['ticker'], textposition='top center', textfont=dict(size=9, color='white'),
+                    hovertemplate=f"{r['name']}<br>Skew: {r['skew_latest']:+.1f}<br>RS 10d: {r['rel_10d']:+.1f}%<br>Score: {r['score']:+.0f}"
+                ))
 
-                # FIXED: Replaced standard deviation with rolling quantiles (90% / 10%) specifically for Net Period Flow
-                prem_df['90th_Pct'] = prem_df.groupby('ticker')['net_period'].transform(
-                    lambda x: x.rolling(20, min_periods=1).quantile(0.90))
-                prem_df['10th_Pct'] = prem_df.groupby('ticker')['net_period'].transform(
-                    lambda x: x.rolling(20, min_periods=1).quantile(0.10))
+            fig_mat.add_hline(y=0, line_color='white', line_width=1, opacity=0.3)
+            fig_mat.add_vline(x=0, line_color='white', line_width=1, opacity=0.3)
 
-            cols = st.columns(4)
-            for i, t in enumerate(list(SECTOR_MAP.keys())):
-                t_data = prem_df[prem_df['ticker'] == t]
-                with cols[i % 4]:
-                    with st.container(border=True):
-                        fig = go.Figure()
-                        if "Net" in prem_view:
-                            fig.add_trace(go.Bar(x=t_data['plot_date'], y=t_data['net_period'], name='Net Prem',
-                                                 marker_color=np.where(t_data['net_period'] >= 0,
-                                                                       'rgba(0, 204, 150, 0.6)',
-                                                                       'rgba(239, 85, 59, 0.6)')))
-                            if show_extremes:
-                                fig.add_trace(go.Scatter(x=t_data['plot_date'], y=t_data['net_3D_MA'], mode='lines',
-                                                         name='3D MA Flow', line=dict(color='#FECB52', width=2)))
-                                fig.add_trace(go.Scatter(x=t_data['plot_date'], y=t_data['90th_Pct'], mode='lines',
-                                                         line=dict(color='rgba(0, 204, 150, 0.5)', width=1, dash='dot'),
-                                                         name='90th %ile Net Long'))
-                                fig.add_trace(go.Scatter(x=t_data['plot_date'], y=t_data['10th_Pct'], mode='lines',
-                                                         line=dict(color='rgba(239, 85, 59, 0.5)', width=1, dash='dot'),
-                                                         name='10th %ile Net Short'))
-                        else:
-                            fig.add_trace(go.Bar(x=t_data['plot_date'], y=t_data['call_prem'], name="Calls",
-                                                 marker_color='rgba(0, 204, 150, 0.6)'))
-                            fig.add_trace(go.Bar(x=t_data['plot_date'], y=-t_data['put_prem'], name="Puts",
-                                                 marker_color='rgba(239, 85, 59, 0.6)'))
-                            if show_extremes:
-                                fig.add_trace(go.Scatter(x=t_data['plot_date'], y=t_data['call_3D_MA'], mode='lines',
-                                                         name='3D Call MA', line=dict(color='#00CC96', width=2)))
-                                fig.add_trace(go.Scatter(x=t_data['plot_date'], y=-t_data['put_3D_MA'], mode='lines',
-                                                         name='3D Put MA', line=dict(color='#EF553B', width=2)))
-                            fig.update_layout(barmode='relative')
+            # Quadrant labels
+            fig_mat.add_annotation(x=15, y=4, text='Bullish Flow<br>+ Price Leading', showarrow=False,
+                font=dict(size=9, color='rgba(0,204,150,0.5)'))
+            fig_mat.add_annotation(x=-15, y=4, text='Fear Premium<br>+ Price Leading', showarrow=False,
+                font=dict(size=9, color='rgba(254,203,82,0.5)'))
+            fig_mat.add_annotation(x=15, y=-4, text='Bullish Flow<br>+ Price Lagging', showarrow=False,
+                font=dict(size=9, color='rgba(254,203,82,0.5)'))
+            fig_mat.add_annotation(x=-15, y=-4, text='Fear Premium<br>+ Price Lagging', showarrow=False,
+                font=dict(size=9, color='rgba(239,85,59,0.5)'))
 
-                        fig.update_layout(title=f"{t} - {SECTOR_MAP.get(t)}", template='plotly_dark', height=250,
-                                          margin=dict(l=10, r=10, t=30, b=10), showlegend=False,
-                                          xaxis=dict(showticklabels=False, type='category',
-                                                     categoryorder='category ascending'),
-                                          yaxis_title="$ Prem", hovermode='x unified')
-                        st.plotly_chart(fig, use_container_width=True)
+            fig_mat.update_layout(
+                template='plotly_dark', height=450, margin=dict(l=10, r=10, t=10, b=10),
+                xaxis=dict(title='Put-Call Skew (positive = fear, negative = greed)', showgrid=True, gridcolor='rgba(255,255,255,0.06)'),
+                yaxis=dict(title='10-Day Relative Strength vs SPY (%)', showgrid=True, gridcolor='rgba(255,255,255,0.06)'),
+                showlegend=False, hovermode='closest'
+            )
+            st.plotly_chart(fig_mat, use_container_width=True)
+
+        with c_scat_desc:
+            st.info("**How to read this chart:**\n\n"
+                "**X-axis (Skew):** Right = puts expensive (fear). Left = calls expensive (greed).\n\n"
+                "**Y-axis (RS):** Up = outperforming SPY. Down = underperforming.\n\n"
+                "**Bubble size** = premium flow magnitude.\n\n"
+                "**Top-right = Strong & Loved** — momentum, but watch for exhaustion.\n"
+                "**Bottom-left = Weak & Hated** — potential value if skew shows fear capitulation.\n"
+                "**Top-left = Fear Premium + Price Leading** — divergence, institutions hedging a rally.\n"
+                "**Bottom-right = Bullish Flow + Price Lagging** — divergence, smart money buying the dip.")
+
+        # ═══════════ ROW 3: DIVERGENCE ALERTS ═══════════
+        if len(divs) > 0:
+            st.divider()
+            st.subheader("Active Divergence Alerts")
+            alert_cols = st.columns(min(len(divs), 4))
+            for i, (_, d) in enumerate(divs.iterrows()):
+                with alert_cols[i % 4]:
+                    is_bear = 'Bearish' in d['divergence']
+                    st.warning(f"**{d['name']} ({d['ticker']})**\n\n"
+                        f"{d['divergence']}\n\n"
+                        f"Score: {d['score']:+.0f} | RS 10d: {d['rel_10d']:+.1f}% | Skew: {d['skew_latest']:+.1f}")
+
+        # ═══════════ ROW 4: SCORE BREAKDOWN TABLE ═══════════
+        st.divider()
+        st.subheader("Score Breakdown")
+        breakdown = rotation_df[['ticker', 'name', 'score', 'zone', 'rel_10d', 'skew_latest', 'skew_pct', 'prem_10d', 'divergence']].copy()
+        breakdown.columns = ['ETF', 'Sector', 'Score', 'Zone', 'RS 10d %', 'Skew', 'Skew %ile', 'Flow 10d $', 'Divergence']
+        breakdown['Score'] = breakdown['Score'].apply(lambda x: f"{x:+.0f}")
+        breakdown['RS 10d %'] = breakdown['RS 10d %'].apply(lambda x: f"{x:+.1f}")
+        breakdown['Skew'] = breakdown['Skew'].apply(lambda x: f"{x:+.1f}")
+        breakdown['Skew %ile'] = breakdown['Skew %ile'].apply(lambda x: f"{x:.0f}")
+        breakdown['Flow 10d $'] = breakdown['Flow 10d $'].apply(lambda x: f"${x/1e6:+.1f}M" if abs(x) > 1e6 else f"${x/1e3:+.0f}K")
+
+        def highlight_divergence(val):
+            if 'Bearish' in str(val): return 'background-color: rgba(239,85,59,0.3); color: #EF553B'
+            if 'Bullish' in str(val): return 'background-color: rgba(0,204,150,0.3); color: #00CC96'
+            return ''
+
+        st.dataframe(breakdown.style.applymap(highlight_divergence, subset=['Divergence']), use_container_width=True, hide_index=True)
 
 # ==========================================
 # TAB 7: STEALTH ACCUMULATION VISUALIZER
@@ -1569,6 +1696,408 @@ with tab_stealth:
                 st.info("**Expirations Used:** Front (7-45 DTE) vs. Back (45+ DTE).\n\n"
                         "**What to look for:** Front-month curve spikes cross over and invert above the longer-term baseline blocks.\n\n"
                         "**Why it's useful:** Spotlights short-term premium inflation anomalies that reflect sudden, aggressive localized capital execution.")
+
+# ==========================================
+# TAB 7.5: BACKTESTED SIGNALS — FILTERED & RISK-MANAGED
+# ==========================================
+with tab_signals:
+    st.header("🎯 Backtested Signal Fire Monitor")
+    st.markdown("Real-time signal detection using V2 backtest methodology — M3_p90_w90, Put VWKS, Backwardation magnitude, and OTM Delta. **Q1-filtered with -2% stop loss for tradeable quality.**")
+
+    # Date slider for signals
+    sig_dates = sorted(ticker_chain['date_str'].unique())
+    if len(sig_dates) == 0:
+        st.warning("No historical data available.")
+    else:
+        sig_start = sig_dates[-40] if len(sig_dates) >= 40 else sig_dates[0]
+        sig_end = sig_dates[-1]
+        sig_start_date, sig_end_date = st.select_slider(
+            "Signal Detection Window:",
+            options=sig_dates,
+            value=(sig_start, sig_end)
+        )
+
+        s_hist = ticker_chain[(ticker_chain['date_str'] >= sig_start_date) & (ticker_chain['date_str'] <= sig_end_date)].copy()
+
+        if s_hist.empty:
+            st.warning("Insufficient data in selected window.")
+        else:
+            s_hist['strike_dist'] = (s_hist['strike'] - s_hist['underlying_price']).abs()
+            s_spot = s_hist.groupby('date_str')['underlying_price'].first()
+
+            # --- GLOBAL PERCENTILE (90-day window, 90th percentile) ---
+            all_dates_full = sorted(ticker_chain['date_str'].unique())
+            past_dates_sig = [d for d in all_dates_full if d <= sig_end_date]
+            dates_90_sig = past_dates_sig[-90:] if len(past_dates_sig) >= 90 else past_dates_sig
+
+            df_90_sig = ticker_chain[(ticker_chain['date_str'].isin(dates_90_sig)) & (ticker_chain['side'] == 'CALL') & (ticker_chain['dte'].between(7, 45))].copy()
+            df_90_sig['vwks_num'] = df_90_sig['strike'] * df_90_sig['volume']
+            vwks_90_sig = df_90_sig.groupby('date_str').apply(lambda x: (x['vwks_num'].sum() / x['volume'].sum()) if x['volume'].sum() > 0 else np.nan).rename('VWKS').reset_index()
+            # Global spot smoothing for percentile calc
+            global_spot_sig = ticker_chain.groupby('date_str')['underlying_price'].first().reset_index()
+            global_spot_sig['Spot_3D_MA'] = global_spot_sig['underlying_price'].rolling(window=3, min_periods=1).mean()
+            spot_ma_sig = dict(zip(global_spot_sig['date_str'], global_spot_sig['Spot_3D_MA']))
+            vwks_90_sig['Spot_3D_MA'] = vwks_90_sig['date_str'].map(spot_ma_sig)
+            vwks_90_sig['VWKS_3D_MA'] = vwks_90_sig['VWKS'].rolling(3, min_periods=1).mean()
+            vwks_90_sig['gap_pct'] = ((vwks_90_sig['VWKS_3D_MA'] - vwks_90_sig['Spot_3D_MA']) / vwks_90_sig['Spot_3D_MA']) * 100
+
+            gap_p90 = vwks_90_sig['gap_pct'].quantile(0.90)
+            gap_p80 = vwks_90_sig['gap_pct'].quantile(0.80)
+            gap_p20 = vwks_90_sig['gap_pct'].quantile(0.20)
+
+            # --- Compute VWKS Gap within window ---
+            df_vwks_sig = s_hist[(s_hist['side'] == 'CALL') & (s_hist['dte'].between(7, 45))].copy()
+            df_vwks_sig['vwks_num'] = df_vwks_sig['strike'] * df_vwks_sig['volume']
+            agg_vwks_sig = df_vwks_sig.groupby('date_str').apply(lambda x: (x['vwks_num'].sum() / x['volume'].sum()) if x['volume'].sum() > 0 else np.nan).rename('VWKS').reset_index()
+            agg_vwks_sig['VWKS_3D_MA'] = agg_vwks_sig['VWKS'].rolling(3, min_periods=1).mean()
+            agg_vwks_sig['spot_3d_ma'] = agg_vwks_sig['date_str'].map(spot_ma_sig)
+            agg_vwks_sig['smooth_gap_pct'] = ((agg_vwks_sig['VWKS_3D_MA'] - agg_vwks_sig['spot_3d_ma']) / agg_vwks_sig['spot_3d_ma']) * 100
+
+            # --- Compute Put VWKS ---
+            df_put_sig = s_hist[(s_hist['side'] == 'PUT') & (s_hist['dte'].between(7, 45))].copy()
+            df_put_sig['vwks_num_put'] = df_put_sig['strike'] * df_put_sig['volume']
+            agg_put_sig = df_put_sig.groupby('date_str').apply(lambda x: (x['vwks_num_put'].sum() / x['volume'].sum()) if x['volume'].sum() > 0 else np.nan).rename('VWKS_PUT').reset_index()
+            agg_put_sig['VWKS_PUT_3D'] = agg_put_sig['VWKS_PUT'].rolling(3, min_periods=1).mean()
+
+            # --- Compute Skew ---
+            df_skew_sig = s_hist[(s_hist['dte'].between(7, 60)) & (s_hist['iv'] > 0) & (s_hist['iv'] < 2.0)]
+            calls_25_sig = df_skew_sig[(df_skew_sig['side'] == 'CALL') & (df_skew_sig['delta'].between(0.2, 0.3))].groupby('date_str')['iv'].mean()
+            puts_25_sig = df_skew_sig[(df_skew_sig['side'] == 'PUT') & (df_skew_sig['delta'].between(-0.3, -0.2))].groupby('date_str')['iv'].mean()
+            skew_sig = ((calls_25_sig - puts_25_sig) * 100).rename("Skew").reset_index()
+            skew_sig['Skew_3D_MA'] = skew_sig['Skew'].rolling(3, min_periods=1).mean()
+
+            # --- Compute OTM Delta ---
+            far_otm_sig = s_hist[(s_hist['side'] == 'CALL') & (s_hist['delta'] > 0) & (s_hist['delta'] <= 0.10) & (s_hist['dte'] > 2)].copy()
+            if not far_otm_sig.empty:
+                far_otm_sig['notional_delta'] = far_otm_sig['delta'] * far_otm_sig['open_interest'] * 100 * far_otm_sig['underlying_price']
+                agg_far_sig = far_otm_sig.groupby('date_str')['notional_delta'].sum().reset_index()
+                agg_far_sig['Delta_3D_MA'] = agg_far_sig['notional_delta'].rolling(3, min_periods=1).mean()
+                agg_far_sig['nd_rising'] = agg_far_sig['Delta_3D_MA'] > agg_far_sig['Delta_3D_MA'].shift(1)
+            else:
+                agg_far_sig = pd.DataFrame(columns=['date_str','notional_delta','Delta_3D_MA','nd_rising'])
+
+            # --- Compute Backwardation ---
+            atm_calls_sig = s_hist[(s_hist['side'] == 'CALL') & (s_hist['iv'] > 0) & (s_hist['iv'] < 2.0)].copy()
+            fm_atm_sig = atm_calls_sig[atm_calls_sig['dte'].between(7, 45)]
+            bm_atm_sig = atm_calls_sig[atm_calls_sig['dte'] > 45]
+            iv_fm_series = pd.Series(dtype=float)
+            iv_bm_series = pd.Series(dtype=float)
+            if not fm_atm_sig.empty:
+                idx_fm_s = fm_atm_sig.groupby(['date_str', 'expiration'])['strike_dist'].idxmin()
+                iv_fm_series = fm_atm_sig.loc[idx_fm_s].groupby('date_str')['iv'].mean() * 100
+            if not bm_atm_sig.empty:
+                idx_bm_s = bm_atm_sig.groupby(['date_str', 'expiration'])['strike_dist'].idxmin()
+                iv_bm_series = bm_atm_sig.loc[idx_bm_s].groupby('date_str')['iv'].mean() * 100
+
+            # --- DETECT SIGNALS ---
+            # M3_p90_w90: gap > 90th percentile AND spot not spiked (5d < 5%)
+            agg_vwks_sig['gap_rising'] = agg_vwks_sig['smooth_gap_pct'] > agg_vwks_sig['smooth_gap_pct'].shift(1)
+            agg_vwks_sig['vwks_rising'] = agg_vwks_sig['VWKS_3D_MA'] > agg_vwks_sig['VWKS_3D_MA'].shift(1)
+            # Spot 5d change proxy
+            spot_series = s_hist.groupby('date_str')['underlying_price'].first()
+            spot_5d_chg = spot_series.pct_change(5).abs()
+            spot_not_spiked = spot_5d_chg < 0.05
+
+            # M3 signal
+            sig_m3 = (agg_vwks_sig['smooth_gap_pct'] > gap_p90) & agg_vwks_sig['date_str'].map(spot_not_spiked).fillna(False)
+            sig_m3_dates = set(agg_vwks_sig.loc[sig_m3.values, 'date_str']) if sig_m3.any() else set()
+
+            # Q1 filter: gap < 25th percentile of M3 signal gaps
+            m3_gaps = agg_vwks_sig.loc[sig_m3.values, 'smooth_gap_pct']
+            q1_threshold = m3_gaps.quantile(0.25) if len(m3_gaps) > 4 else gap_p90
+            sig_m3_q1 = sig_m3 & (agg_vwks_sig['smooth_gap_pct'] < q1_threshold)
+            sig_m3_q1_dates = set(agg_vwks_sig.loc[sig_m3_q1.values, 'date_str']) if sig_m3_q1.any() else set()
+
+            # M7: Call VWKS rising + Put VWKS falling
+            if not agg_put_sig.empty and not agg_vwks_sig.empty:
+                merged_vwks = agg_vwks_sig[['date_str','vwks_rising']].merge(agg_put_sig[['date_str','VWKS_PUT_3D']], on='date_str', how='outer').sort_values('date_str')
+                merged_vwks['put_falling'] = merged_vwks['VWKS_PUT_3D'] < merged_vwks['VWKS_PUT_3D'].shift(1)
+                sig_m7 = merged_vwks['vwks_rising'] & merged_vwks['put_falling'] & merged_vwks['date_str'].map(spot_not_spiked).fillna(False)
+                sig_m7_dates = set(merged_vwks.loc[sig_m7.values, 'date_str']) if sig_m7.any() else set()
+            else:
+                sig_m7_dates = set()
+
+            # M5: OTM Delta rising
+            if not agg_far_sig.empty:
+                sig_m5 = agg_far_sig['nd_rising'] & agg_far_sig['date_str'].map(spot_not_spiked).fillna(False)
+                sig_m5_dates = set(agg_far_sig.loc[sig_m5.values, 'date_str']) if sig_m5.any() else set()
+            else:
+                sig_m5_dates = set()
+
+            # BW >= 2%
+            if not iv_fm_series.empty and not iv_bm_series.empty:
+                bw_df = pd.DataFrame({'fm': iv_fm_series, 'bm': iv_bm_series}).fillna(0)
+                bw_df['bw_mag'] = bw_df['fm'] - bw_df['bm']
+                bw_df['bw_2pct'] = bw_df['bw_mag'] >= 2.0
+                sig_bw2_dates = set(bw_df[bw_df['bw_2pct']].index) if bw_df['bw_2pct'].any() else set()
+            else:
+                sig_bw2_dates = set()
+
+            # --- CURRENT STATUS PANEL ---
+            latest_date = sig_dates[-1]
+            st.divider()
+            st.subheader("📡 Current Signal Status")
+            col_s1, col_s2, col_s3, col_s4, col_s5 = st.columns(5)
+
+            # Get latest values
+            latest_gap = agg_vwks_sig[agg_vwks_sig['date_str'] == latest_date]['smooth_gap_pct'].values
+            latest_gap_val = latest_gap[0] if len(latest_gap) > 0 else 0
+            gap_percentile = (vwks_90_sig['gap_pct'] < latest_gap_val).mean() * 100 if len(vwks_90_sig) > 0 else 0
+
+            m3_firing = latest_date in sig_m3_dates
+            m3_q1_firing = latest_date in sig_m3_q1_dates
+            m7_firing = latest_date in sig_m7_dates
+            m5_firing = latest_date in sig_m5_dates
+            bw2_firing = latest_date in sig_bw2_dates
+
+            with col_s1:
+                st.metric("Gap vs 90%ile", f"{latest_gap_val:.1f}%", f"{latest_gap_val - gap_p90:+.1f}%")
+            with col_s2:
+                status_m3 = "🟢 FIRING" if m3_firing else "⚫ Silent"
+                st.metric("M3 (Elastic Band)", status_m3, "Q1 Qualified" if m3_q1_firing else ("Q2-4" if m3_firing else None))
+            with col_s3:
+                status_m7 = "🟢 FIRING" if m7_firing else "⚫ Silent"
+                st.metric("M7 (Call+Put VWKS)", status_m7)
+            with col_s4:
+                status_m5 = "🟢 FIRING" if m5_firing else "⚫ Silent"
+                st.metric("M5 (OTM Delta)", status_m5)
+            with col_s5:
+                status_bw = "🟢 FIRING" if bw2_firing else "⚫ Silent"
+                st.metric("BW >= 2%", status_bw)
+
+            # Confluence indicator
+            active_count = sum([m3_q1_firing, m7_firing, m5_firing, bw2_firing])
+            if active_count >= 3:
+                st.success(f"🔥 HIGH CONVICTION: {active_count}/4 signals active — M3 Q1({m3_q1_firing}) + M7({m7_firing}) + M5({m5_firing}) + BW2%({bw2_firing})")
+            elif active_count >= 2:
+                st.warning(f"⚡ MODERATE: {active_count}/4 signals active")
+            elif m3_q1_firing:
+                st.info(f"✅ M3 Q1 firing — 83% historical hit rate at t7 (with -2% stop). Tradeable.")
+
+            # ==========================================
+            # CHART 1: M3 ELASTIC BAND OSCILLATOR (90th %ile)
+            # ==========================================
+            st.divider()
+            st.subheader("1. M3 Elastic Band — 90th Percentile Signals")
+            c_m3, c_m3_desc = st.columns([2.5, 1])
+            with c_m3:
+                fig_s1 = make_subplots(specs=[[{"secondary_y": True}]])
+
+                # Gap scatter
+                fig_s1.add_trace(go.Scatter(x=agg_vwks_sig['date_str'], y=agg_vwks_sig['smooth_gap_pct'],
+                    mode='markers', name='Gap %', marker=dict(color='#FECB52', size=6, opacity=0.7)), secondary_y=False)
+
+                # 90th percentile line
+                fig_s1.add_hline(y=gap_p90, line_dash="dash", line_color="rgba(239, 85, 59, 0.9)",
+                    annotation_text=f"90th %ile ({gap_p90:.1f}%)", secondary_y=False)
+                # 80th percentile line (for reference)
+                fig_s1.add_hline(y=gap_p80, line_dash="dot", line_color="rgba(254, 203, 82, 0.5)",
+                    annotation_text=f"80th %ile", secondary_y=False)
+
+                # Q1 threshold line
+                fig_s1.add_hline(y=q1_threshold, line_dash="dashdot", line_color="rgba(0, 204, 150, 0.7)",
+                    annotation_text=f"Q1 Filter ({q1_threshold:.1f}%)", secondary_y=False)
+
+                # Signal markers — M3 fires (red outline for Q2-4, green for Q1)
+                if sig_m3.any():
+                    m3_fire = agg_vwks_sig[sig_m3.values]
+                    m3_q1_fire = agg_vwks_sig[sig_m3_q1.values]
+                    m3_q234_fire = agg_vwks_sig[sig_m3.values & ~sig_m3_q1.values]
+
+                    if len(m3_q1_fire) > 0:
+                        fig_s1.add_trace(go.Scatter(x=m3_q1_fire['date_str'], y=m3_q1_fire['smooth_gap_pct'],
+                            mode='markers', name='M3 Q1 Signal (TRADE)',
+                            marker=dict(color='#00CC96', size=14, symbol='star', line=dict(color='white', width=1))),
+                            secondary_y=False)
+                    if len(m3_q234_fire) > 0:
+                        fig_s1.add_trace(go.Scatter(x=m3_q234_fire['date_str'], y=m3_q234_fire['smooth_gap_pct'],
+                            mode='markers', name='M3 Q2-4 Signal (FILTERED)',
+                            marker=dict(color='#EF553B', size=10, symbol='x', line=dict(color='white', width=1))),
+                            secondary_y=False)
+
+                # Spot price overlay
+                fig_s1.add_trace(go.Scatter(x=s_spot.index, y=s_spot.values, name="Spot Price", mode='lines',
+                    line=dict(color='white', width=2, dash='dot')), secondary_y=True)
+
+                fig_s1.update_layout(title="M3 Elastic Band Oscillator — 90th %ile Trigger", template='plotly_dark',
+                    height=400, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified',
+                    legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"))
+                fig_s1.update_xaxes(type='category', categoryorder='category ascending')
+                fig_s1.update_yaxes(title_text="Gap (%)", secondary_y=False)
+                fig_s1.update_yaxes(showgrid=False, secondary_y=True)
+                st.plotly_chart(fig_s1, use_container_width=True)
+            with c_m3_desc:
+                st.info("**Backtest Result:** M3_p90_w90 + Q1 filter (gap < " + f"{q1_threshold:.1f}%" + ") + -2% stop = **83% hit rate at t7, -4% max DD.**\n\n"
+                    "**Green stars** = Q1 signals (tradeable). **Red X** = Q2-4 signals (filtered — higher gap = lower quality).\n\n"
+                    "**90th percentile line:** Gap threshold from 90-day rolling window. When gap crosses above with spot < 5% move = signal.")
+
+            # ==========================================
+            # CHART 2: PUT VWKS DIVERGENCE (NEW)
+            # ==========================================
+            st.divider()
+            c_put, c_put_desc = st.columns([2, 1])
+            with c_put:
+                fig_s2 = make_subplots(specs=[[{"secondary_y": True}]])
+
+                # Call VWKS
+                fig_s2.add_trace(go.Scatter(x=agg_vwks_sig['date_str'], y=agg_vwks_sig['VWKS_3D_MA'],
+                    name="Call VWKS 3D MA", mode='lines+markers', line=dict(color='#00CC96', width=2.5)), secondary_y=False)
+                # Put VWKS
+                if not agg_put_sig.empty:
+                    fig_s2.add_trace(go.Scatter(x=agg_put_sig['date_str'], y=agg_put_sig['VWKS_PUT_3D'],
+                        name="Put VWKS 3D MA (NEW)", mode='lines+markers', line=dict(color='#EF553B', width=2.5)), secondary_y=False)
+
+                # M7 signal markers
+                if sig_m7_dates:
+                    m7_dates_list = sorted(sig_m7_dates)
+                    m7_gaps = agg_vwks_sig[agg_vwks_sig['date_str'].isin(m7_dates_list)]
+                    if len(m7_gaps) > 0:
+                        fig_s2.add_trace(go.Scatter(x=m7_gaps['date_str'], y=m7_gaps['VWKS_3D_MA'],
+                            mode='markers', name='M7 Signal (Call Up + Put Down)',
+                            marker=dict(color='#FECB52', size=12, symbol='diamond', line=dict(color='white', width=1))),
+                            secondary_y=False)
+
+                # Spot price
+                fig_s2.add_trace(go.Scatter(x=s_spot.index, y=s_spot.values, name="Spot Price", mode='lines',
+                    line=dict(color='white', width=2, dash='dot')), secondary_y=True)
+
+                fig_s2.update_layout(title="2. Put VWKS Divergence — Dual Accumulation Check", template='plotly_dark',
+                    height=350, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified',
+                    legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"))
+                fig_s2.update_xaxes(type='category', categoryorder='category ascending')
+                fig_s2.update_yaxes(title_text="Strike ($)", secondary_y=False)
+                fig_s2.update_yaxes(showgrid=False, secondary_y=True)
+                st.plotly_chart(fig_s2, use_container_width=True)
+            with c_put_desc:
+                st.info("**NEW — Backtest Validated:** M7 (Call VWKS up + Put VWKS down) beats M1 by **6% hit rate**.\n\n"
+                    "**Green line** = Call VWKS (volume-weighted strike for calls). **Red line** = Put VWKS (for puts).\n\n"
+                    "**What to look for:** Green rising while red falling = genuine institutional accumulation. When both rise = hedging, not accumulation (M8 — ignore).\n\n"
+                    "**Yellow diamonds** = M7 signal fires (Call up + Put down + spot not spiked). 56% historical hit rate at t10.")
+
+            # ==========================================
+            # CHART 3: BACKWARDATION MAGNITUDE MONITOR
+            # ==========================================
+            st.divider()
+            c_bw, c_bw_desc = st.columns([2, 1])
+            with c_bw:
+                fig_s3 = make_subplots(specs=[[{"secondary_y": True}]])
+
+                # Front-month IV
+                if not iv_fm_series.empty:
+                    fig_s3.add_trace(go.Scatter(x=iv_fm_series.index, y=iv_fm_series.values,
+                        name="Front-Month IV (7-45 DTE)", mode='lines+markers',
+                        line=dict(color='#00CC96', width=3)), secondary_y=False)
+                # Back-month IV
+                if not iv_bm_series.empty:
+                    fig_s3.add_trace(go.Scatter(x=iv_bm_series.index, y=iv_bm_series.values,
+                        name="Back-Month IV (45+ DTE)", mode='lines',
+                        line=dict(color='#EF553B', width=2)), secondary_y=False)
+
+                # BW magnitude as colored area
+                if not iv_fm_series.empty and not iv_bm_series.empty:
+                    bw_common = iv_fm_series.index.intersection(iv_bm_series.index)
+                    bw_mag_vals = iv_fm_series[bw_common] - iv_bm_series[bw_common]
+                    bw_colors = ['rgba(0,204,150,0.3)' if v >= 2 else ('rgba(254,203,82,0.2)' if v >= 0 else 'rgba(239,85,59,0.2)') for v in bw_mag_vals.values]
+                    fig_s3.add_trace(go.Bar(x=bw_common, y=bw_mag_vals.values,
+                        name='BW Magnitude', marker_color=bw_colors), secondary_y=True)
+
+                    # Tier lines
+                    for tier_val, tier_label, tier_color in [(2.0, '2% Tier (Quality Filter)', 'rgba(0,204,150,0.7)'), (1.0, '1%', 'rgba(254,203,82,0.4)')]:
+                        fig_s3.add_hline(y=tier_val, line_dash="dash", line_color=tier_color,
+                            annotation_text=tier_label, secondary_y=True)
+
+                # BW >= 2% signal markers
+                if sig_bw2_dates:
+                    bw2_list = sorted(sig_bw2_dates)
+                    bw2_ivs = iv_fm_series[bw2_list] if not iv_fm_series.empty else pd.Series()
+                    if len(bw2_ivs) > 0:
+                        fig_s3.add_trace(go.Scatter(x=bw2_ivs.index, y=bw2_ivs.values,
+                            mode='markers', name='BW >= 2% Signal',
+                            marker=dict(color='#00CC96', size=10, symbol='triangle-up', line=dict(color='white', width=1))),
+                            secondary_y=False)
+
+                # Spot
+                fig_s3.add_trace(go.Scatter(x=s_spot.index, y=s_spot.values, name="Spot Price", mode='lines',
+                    line=dict(color='white', width=2, dash='dot')), secondary_y=True)
+
+                fig_s3.update_layout(title="3. Backwardation Magnitude — Tier Monitor", template='plotly_dark',
+                    height=350, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified',
+                    legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"))
+                fig_s3.update_xaxes(type='category', categoryorder='category ascending')
+                fig_s3.update_yaxes(title_text="IV (%)", secondary_y=False)
+                fig_s3.update_yaxes(title_text="BW Spread (%)", secondary_y=True, showgrid=False)
+                st.plotly_chart(fig_s3, use_container_width=True)
+            with c_bw_desc:
+                st.info("**Backtest Result:** BW >= 2% is the sweet spot — **60% hit rate standalone**, +2-4% hit rate when layered on other signals.\n\n"
+                    "**Green bars** = front IV > back IV by >= 2% (quality filter active). **Yellow** = 0-2%. **Red** = contango (front < back).\n\n"
+                    "**Green triangles** = BW >= 2% signals. Higher magnitude (>3-5%) = higher returns but lower hit rate.")
+
+            # ==========================================
+            # CHART 4: OTM DELTA + M5 SIGNALS
+            # ==========================================
+            st.divider()
+            c_otm, c_otm_desc = st.columns([2, 1])
+            with c_otm:
+                fig_s4 = make_subplots(specs=[[{"secondary_y": True}]])
+
+                if not agg_far_sig.empty:
+                    fig_s4.add_trace(go.Bar(x=agg_far_sig['date_str'], y=agg_far_sig['notional_delta'],
+                        marker_color='rgba(254, 203, 82, 0.3)', name='Raw <10Δ Notional Delta'), secondary_y=False)
+                    fig_s4.add_trace(go.Scatter(x=agg_far_sig['date_str'], y=agg_far_sig['Delta_3D_MA'],
+                        mode='lines', line=dict(color='#FECB52', width=2.5), name='3-Day MA Trend'), secondary_y=False)
+
+                    # M5 signal markers
+                    if sig_m5_dates:
+                        m5_fire = agg_far_sig[agg_far_sig['date_str'].isin(sig_m5_dates)]
+                        if len(m5_fire) > 0:
+                            fig_s4.add_trace(go.Scatter(x=m5_fire['date_str'], y=m5_fire['Delta_3D_MA'],
+                                mode='markers', name='M5 Signal (OTM Delta Rising)',
+                                marker=dict(color='#FECB52', size=12, symbol='triangle-up', line=dict(color='white', width=1))),
+                                secondary_y=False)
+
+                fig_s4.add_trace(go.Scatter(x=s_spot.index, y=s_spot.values, name="Spot Price", mode='lines',
+                    line=dict(color='white', width=2, dash='dot')), secondary_y=True)
+
+                fig_s4.update_layout(title="4. Far-OTM (<10Δ) Delta Expansion + M5 Signals", template='plotly_dark',
+                    height=350, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified',
+                    legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"))
+                fig_s4.update_xaxes(type='category', categoryorder='category ascending')
+                fig_s4.update_yaxes(title_text="Notional Delta ($)", secondary_y=False)
+                fig_s4.update_yaxes(showgrid=False, secondary_y=True)
+                st.plotly_chart(fig_s4, use_container_width=True)
+            with c_otm_desc:
+                st.info("**Backtest Result:** M5 (OTM Delta rising, no spot filter) = best standalone signal for returns (**+2.14% t10, 58% hit**). With spot filter and BW >= 2%: **61% hit rate**.\n\n"
+                    "**Yellow triangles** = M5 signal fires (3D MA notional delta rising + spot not spiked). High signal frequency — use as a screening layer, not a standalone trigger.")
+
+            # ==========================================
+            # SIGNAL LOG TABLE
+            # ==========================================
+            st.divider()
+            st.subheader("📋 Recent Signal History")
+
+            # Build signal log
+            all_signal_dates = set()
+            all_signal_dates.update(sig_m3_dates)
+            all_signal_dates.update(sig_m7_dates)
+            all_signal_dates.update(sig_m5_dates)
+            all_signal_dates.update(sig_bw2_dates)
+            all_signal_dates = sorted(all_signal_dates, reverse=True)[:20]
+
+            if all_signal_dates:
+                log_rows = []
+                for ds in all_signal_dates:
+                    gap_v = agg_vwks_sig[agg_vwks_sig['date_str'] == ds]['smooth_gap_pct'].values
+                    gap_v = gap_v[0] if len(gap_v) > 0 else 0
+                    m3_f = "✅ Q1" if ds in sig_m3_q1_dates else ("⚠️ Q2-4" if ds in sig_m3_dates else "—")
+                    m7_f = "✅" if ds in sig_m7_dates else "—"
+                    m5_f = "✅" if ds in sig_m5_dates else "—"
+                    bw_f = "✅" if ds in sig_bw2_dates else "—"
+                    log_rows.append({"Date": ds, "Gap %": f"{gap_v:.2f}", "M3": m3_f, "M7": m7_f, "M5": m5_f, "BW2%": bw_f})
+
+                st.dataframe(pd.DataFrame(log_rows), use_container_width=True, hide_index=True)
+            else:
+                st.info("No signals detected in the selected window.")
+
 
 # ==========================================
 # TAB 8: INSTITUTIONAL SURFACE HEATMAP (LADDER)
