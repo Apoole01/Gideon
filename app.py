@@ -2027,6 +2027,16 @@ with tab_signals:
             with c_put:
                 fig_s2 = make_subplots(specs=[[{"secondary_y": True}]])
 
+                # Yellow background bars first (render behind everything)
+                all_dates_c2 = sorted(set(agg_vwks_sig['date_str']))
+                hl_mask_c2 = [d in hl_dates_3d for d in all_dates_c2]
+                y_min_c2 = min(agg_vwks_sig['VWKS_3D_MA'].min(), agg_put_sig['VWKS_PUT_3D'].min(), s_spot.min()) * 0.98
+                y_max_c2 = max(agg_vwks_sig['VWKS_3D_MA'].max(), agg_put_sig['VWKS_PUT_3D'].max(), s_spot.max()) * 1.02
+                fig_s2.add_trace(go.Bar(x=all_dates_c2, y=[y_max_c2]*len(all_dates_c2),
+                    base=[y_min_c2]*len(all_dates_c2),
+                    marker_color=['rgba(255,255,0,0.18)' if m else 'rgba(0,0,0,0)' for m in hl_mask_c2],
+                    marker_line_width=0, showlegend=False, hoverinfo='skip'), secondary_y=False)
+
                 # Call VWKS
                 fig_s2.add_trace(go.Scatter(x=agg_vwks_sig['date_str'], y=agg_vwks_sig['VWKS_3D_MA'],
                     name="Call VWKS 3D MA", mode='lines+markers', line=dict(color='#00CC96', width=2.5)), secondary_y=False)
@@ -2049,10 +2059,6 @@ with tab_signals:
                 fig_s2.add_trace(go.Scatter(x=s_spot.index, y=s_spot.values, name="Spot Price", mode='lines',
                     line=dict(color='white', width=2, dash='dot')), secondary_y=False)
 
-                # Yellow highlight: days where spot is within 2% of VWKS or has crossed over
-                for d in hl_dates_3d:
-                    fig_s2.add_vrect(x0=d, x1=d, fillcolor="yellow", opacity=0.15, line_width=0, layer="below")
-
                 fig_s2.update_layout(title="2. Put VWKS Divergence — Dual Accumulation Check", template='plotly_dark',
                     height=350, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified',
                     legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"))
@@ -2072,6 +2078,16 @@ with tab_signals:
             c_put5, c_put5_desc = st.columns([2, 1])
             with c_put5:
                 fig_s3 = make_subplots(specs=[[{"secondary_y": False}]])
+
+                # Yellow background bars first (render behind everything)
+                all_dates_c3 = sorted(set(agg_vwks_sig['date_str']))
+                hl_mask_c3 = [d in hl_dates_5d for d in all_dates_c3]
+                y_min_c3 = min(agg_vwks_sig['VWKS_5D_MA'].min(), agg_put_sig['VWKS_PUT_5D'].min(), s_spot.min()) * 0.98
+                y_max_c3 = max(agg_vwks_sig['VWKS_5D_MA'].max(), agg_put_sig['VWKS_PUT_5D'].max(), s_spot.max()) * 1.02
+                fig_s3.add_trace(go.Bar(x=all_dates_c3, y=[y_max_c3]*len(all_dates_c3),
+                    base=[y_min_c3]*len(all_dates_c3),
+                    marker_color=['rgba(255,255,0,0.18)' if m else 'rgba(0,0,0,0)' for m in hl_mask_c3],
+                    marker_line_width=0, showlegend=False, hoverinfo='skip'))
 
                 # Call VWKS 5D MA
                 fig_s3.add_trace(go.Scatter(x=agg_vwks_sig['date_str'], y=agg_vwks_sig['VWKS_5D_MA'],
@@ -2093,10 +2109,6 @@ with tab_signals:
                 # Spot price
                 fig_s3.add_trace(go.Scatter(x=s_spot.index, y=s_spot.values, name="Spot Price", mode='lines',
                     line=dict(color='white', width=2, dash='dot')))
-
-                # Yellow highlight: days where spot is within 2% of VWKS or has crossed over (5D version)
-                for d in hl_dates_5d:
-                    fig_s3.add_vrect(x0=d, x1=d, fillcolor="yellow", opacity=0.15, line_width=0, layer="below")
 
                 fig_s3.update_layout(title="3. Put VWKS Divergence — 5-Day MA (Smoother Trend)", template='plotly_dark',
                     height=350, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified',
