@@ -1774,12 +1774,37 @@ with tab_signals:
             skew_sig = ((calls_25_sig - puts_25_sig) * 100).rename("Skew").reset_index()
             skew_sig['Skew_3D_MA'] = skew_sig['Skew'].rolling(3, min_periods=1).mean()
 
-            # --- Compute OTM Delta ---
-            far_otm_sig = s_hist[(s_hist['side'] == 'CALL') & (s_hist['delta'] > 0) & (s_hist['delta'] <= 0.10) & (s_hist['dte'] > 2)].copy()
-            if not far_otm_sig.empty:
-                far_otm_sig['notional_delta'] = far_otm_sig['delta'] * far_otm_sig['open_interest'] * 100 * far_otm_sig['underlying_price']
-                agg_far_sig = far_otm_sig.groupby('date_str')['notional_delta'].sum().reset_index()
-                agg_far_sig['Delta_3D_MA'] = agg_far_sig['notional_delta'].rolling(3, min_periods=1).mean()
+            # --- Compute OTM Delta (CALLS + PUTS) ---
+            far_call_sig = s_hist[(s_hist['side'] == 'CALL') & (s_hist['delta'] > 0) & (s_hist['delta'] <= 0.10) & (s_hist['dte'] > 2)].copy()
+            far_put_sig = s_hist[(s_hist['side'] == 'PUT') & (s_hist['delta'] < 0) & (s_hist['delta'] >= -0.10) & (s_hist['dte'] > 2)].copy()
+
+            agg_call_sig = pd.DataFrame(columns=['date_str','notional_delta','Delta_3D_MA'])
+            agg_put_sig_otm = pd.DataFrame(columns=['date_str','notional_delta','Delta_3D_MA'])
+            agg_net_sig = pd.DataFrame(columns=['date_str','net_delta','Net_3D_MA'])
+
+            if not far_call_sig.empty:
+                far_call_sig['notional_delta'] = far_call_sig['delta'] * far_call_sig['open_interest'] * 100 * far_call_sig['underlying_price']
+                agg_call_sig = far_call_sig.groupby('date_str')['notional_delta'].sum().reset_index()
+                agg_call_sig['Delta_3D_MA'] = agg_call_sig['notional_delta'].rolling(3, min_periods=1).mean()
+
+            if not far_put_sig.empty:
+                far_put_sig['notional_delta'] = far_put_sig['delta'].abs() * far_put_sig['open_interest'] * 100 * far_put_sig['underlying_price']
+                agg_put_sig_otm = far_put_sig.groupby('date_str')['notional_delta'].sum().reset_index()
+                agg_put_sig_otm['Delta_3D_MA'] = agg_put_sig_otm['notional_delta'].rolling(3, min_periods=1).mean()
+
+            # Net notional delta (calls - puts)
+            if not agg_call_sig.empty or not agg_put_sig_otm.empty:
+                net = agg_call_sig[['date_str','notional_delta']].rename(columns={'notional_delta':'call_delta'}).merge(
+                    agg_put_sig_otm[['date_str','notional_delta']].rename(columns={'notional_delta':'put_delta'}),
+                    on='date_str', how='outer').fillna(0).sort_values('date_str')
+                net['net_delta'] = net['call_delta'] - net['put_delta']
+                net['Net_3D_MA'] = net['net_delta'].rolling(3, min_periods=1).mean()
+                net['nd_rising'] = net['Net_3D_MA'] > net['Net_3D_MA'].shift(1)
+                agg_net_sig = net
+
+            # For backward compat with M5 signal detection
+            agg_far_sig = agg_call_sig.copy()
+            if not agg_far_sig.empty:
                 agg_far_sig['nd_rising'] = agg_far_sig['Delta_3D_MA'] > agg_far_sig['Delta_3D_MA'].shift(1)
             else:
                 agg_far_sig = pd.DataFrame(columns=['date_str','notional_delta','Delta_3D_MA','nd_rising'])
@@ -2040,32 +2065,40 @@ with tab_signals:
                     "**Green triangles** = BW >= 2% signals. Higher magnitude (>3-5%) = higher returns but lower hit rate.")
 
             # ==========================================
-            # CHART 4: OTM DELTA + M5 SIGNALS
+            # CHART 4: OTM DELTA — CALLS vs PUTS (Split View)
             # ==========================================
             st.divider()
             c_otm, c_otm_desc = st.columns([2, 1])
             with c_otm:
                 fig_s4 = make_subplots(specs=[[{"secondary_y": True}]])
 
-                if not agg_far_sig.empty:
-                    fig_s4.add_trace(go.Bar(x=agg_far_sig['date_str'], y=agg_far_sig['notional_delta'],
-                        marker_color='rgba(254, 203, 82, 0.3)', name='Raw <10Δ Notional Delta'), secondary_y=False)
-                    fig_s4.add_trace(go.Scatter(x=agg_far_sig['date_str'], y=agg_far_sig['Delta_3D_MA'],
-                        mode='lines', line=dict(color='#FECB52', width=2.5), name='3-Day MA Trend'), secondary_y=False)
+                # Calls (green, positive)
+                if not agg_call_sig.empty:
+                    fig_s4.add_trace(go.Bar(x=agg_call_sig['date_str'], y=agg_call_sig['notional_delta'],
+                        marker_color='rgba(0, 204, 150, 0.35)', name='Calls <10Δ'), secondary_y=False)
+                    fig_s4.add_trace(go.Scatter(x=agg_call_sig['date_str'], y=agg_call_sig['Delta_3D_MA'],
+                        mode='lines', line=dict(color='#00CC96', width=2), name='Calls 3D MA'), secondary_y=False)
 
-                    # M5 signal markers
-                    if sig_m5_dates:
-                        m5_fire = agg_far_sig[agg_far_sig['date_str'].isin(sig_m5_dates)]
-                        if len(m5_fire) > 0:
-                            fig_s4.add_trace(go.Scatter(x=m5_fire['date_str'], y=m5_fire['Delta_3D_MA'],
-                                mode='markers', name='M5 Signal (OTM Delta Rising)',
-                                marker=dict(color='#FECB52', size=12, symbol='triangle-up', line=dict(color='white', width=1))),
-                                secondary_y=False)
+                # Puts (red, shown as negative for visual contrast)
+                if not agg_put_sig_otm.empty:
+                    fig_s4.add_trace(go.Bar(x=agg_put_sig_otm['date_str'], y=-agg_put_sig_otm['notional_delta'],
+                        marker_color='rgba(239, 85, 59, 0.35)', name='Puts <10Δ (neg)', base=None), secondary_y=False)
+                    fig_s4.add_trace(go.Scatter(x=agg_put_sig_otm['date_str'], y=-agg_put_sig_otm['Delta_3D_MA'],
+                        mode='lines', line=dict(color='#EF553B', width=2), name='Puts 3D MA (neg)'), secondary_y=False)
+
+                # M5 signal markers on calls MA
+                if sig_m5_dates and not agg_call_sig.empty:
+                    m5_fire = agg_call_sig[agg_call_sig['date_str'].isin(sig_m5_dates)]
+                    if len(m5_fire) > 0:
+                        fig_s4.add_trace(go.Scatter(x=m5_fire['date_str'], y=m5_fire['Delta_3D_MA'],
+                            mode='markers', name='M5 Signal',
+                            marker=dict(color='#FECB52', size=12, symbol='triangle-up', line=dict(color='white', width=1))),
+                            secondary_y=False)
 
                 fig_s4.add_trace(go.Scatter(x=s_spot.index, y=s_spot.values, name="Spot Price", mode='lines',
                     line=dict(color='white', width=2, dash='dot')), secondary_y=True)
 
-                fig_s4.update_layout(title="4. Far-OTM (<10Δ) Delta Expansion + M5 Signals", template='plotly_dark',
+                fig_s4.update_layout(title="4. Far-OTM (<10Δ) Notional Delta — Calls vs Puts", template='plotly_dark',
                     height=350, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified',
                     legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"))
                 fig_s4.update_xaxes(type='category', categoryorder='category ascending')
@@ -2073,8 +2106,41 @@ with tab_signals:
                 fig_s4.update_yaxes(showgrid=False, secondary_y=True)
                 st.plotly_chart(fig_s4, use_container_width=True)
             with c_otm_desc:
-                st.info("**Backtest Result:** M5 (OTM Delta rising, no spot filter) = best standalone signal for returns (**+2.14% t10, 58% hit**). With spot filter and BW >= 2%: **61% hit rate**.\n\n"
-                    "**Yellow triangles** = M5 signal fires (3D MA notional delta rising + spot not spiked). High signal frequency — use as a screening layer, not a standalone trigger.")
+                st.info("**Calls (green) vs Puts (red) — far-OTM notional delta.**\n\n"
+                    "Puts are displayed as negative for visual contrast. When green bars dominate = bullish speculation. When red bars dominate = bearish hedging.\n\n"
+                    "**Solid lines** = 3-day moving average. **Yellow triangles** = M5 signal (calls 3D MA rising + spot not spiked).")
+
+            # ==========================================
+            # CHART 5: NET NOTIONAL DELTA (Calls — Puts)
+            # ==========================================
+            st.divider()
+            c_net, c_net_desc = st.columns([2, 1])
+            with c_net:
+                fig_s5 = make_subplots(specs=[[{"secondary_y": True}]])
+
+                if not agg_net_sig.empty:
+                    colors_net = ['rgba(0,204,150,0.5)' if v >= 0 else 'rgba(239,85,59,0.5)' for v in agg_net_sig['net_delta']]
+                    fig_s5.add_trace(go.Bar(x=agg_net_sig['date_str'], y=agg_net_sig['net_delta'],
+                        marker_color=colors_net, name='Net Delta (Calls - Puts)'), secondary_y=False)
+                    fig_s5.add_trace(go.Scatter(x=agg_net_sig['date_str'], y=agg_net_sig['Net_3D_MA'],
+                        mode='lines', line=dict(color='white', width=2.5), name='Net 3D MA'), secondary_y=False)
+                    fig_s5.add_hline(y=0, line_color='white', line_width=1, opacity=0.4, secondary_y=False)
+
+                fig_s5.add_trace(go.Scatter(x=s_spot.index, y=s_spot.values, name="Spot Price", mode='lines',
+                    line=dict(color='white', width=2, dash='dot')), secondary_y=True)
+
+                fig_s5.update_layout(title="5. Net Far-OTM Notional Delta (Calls — Puts)", template='plotly_dark',
+                    height=350, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified',
+                    legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"))
+                fig_s5.update_xaxes(type='category', categoryorder='category ascending')
+                fig_s5.update_yaxes(title_text="Net Notional Delta ($)", secondary_y=False)
+                fig_s5.update_yaxes(showgrid=False, secondary_y=True)
+                st.plotly_chart(fig_s5, use_container_width=True)
+            with c_net_desc:
+                st.info("**Net notional delta = Calls minus Puts.**\n\n"
+                    "**Green bars** = calls > puts (bullish speculation dominates). **Red bars** = puts > calls (bearish hedging dominates).\n\n"
+                    "**White line** = 3-day moving average of net delta. Rising = speculative flow building. Falling = hedging increasing.\n\n"
+                    "This is a cleaner view than the split chart — it directly shows whether the options market is net bullish or bearish on far-OTM tails.")
 
             # ==========================================
             # SIGNAL LOG TABLE
