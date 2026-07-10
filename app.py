@@ -1798,7 +1798,7 @@ with tab_signals:
                     agg_put_sig_otm[['date_str','notional_delta']].rename(columns={'notional_delta':'put_delta'}),
                     on='date_str', how='outer').fillna(0).sort_values('date_str')
                 net['net_delta'] = net['call_delta'] - net['put_delta']
-                net['Net_3D_MA'] = net['net_delta'].rolling(3, min_periods=1).mean()
+                net['Net_3D_MA'] = net['net_delta'].rolling(5, min_periods=2).mean()
                 net['nd_rising'] = net['Net_3D_MA'] > net['Net_3D_MA'].shift(1)
                 agg_net_sig = net
 
@@ -2123,7 +2123,7 @@ with tab_signals:
                     fig_s5.add_trace(go.Bar(x=agg_net_sig['date_str'], y=agg_net_sig['net_delta'],
                         marker_color=colors_net, name='Net Delta (Calls - Puts)'), secondary_y=False)
                     fig_s5.add_trace(go.Scatter(x=agg_net_sig['date_str'], y=agg_net_sig['Net_3D_MA'],
-                        mode='lines', line=dict(color='white', width=2.5), name='Net 3D MA'), secondary_y=False)
+                        mode='lines', line=dict(color='#00CC96', width=2.5), name='Net 5D MA'), secondary_y=False)
                     fig_s5.add_hline(y=0, line_color='white', line_width=1, opacity=0.4, secondary_y=False)
 
                 fig_s5.add_trace(go.Scatter(x=s_spot.index, y=s_spot.values, name="Spot Price", mode='lines',
@@ -2139,7 +2139,7 @@ with tab_signals:
             with c_net_desc:
                 st.info("**Net notional delta = Calls minus Puts.**\n\n"
                     "**Green bars** = calls > puts (bullish speculation dominates). **Red bars** = puts > calls (bearish hedging dominates).\n\n"
-                    "**White line** = 3-day moving average of net delta. Rising = speculative flow building. Falling = hedging increasing.\n\n"
+                    "**White line** = 5-day moving average of net delta. Rising = speculative flow building. Falling = hedging increasing.\n\n"
                     "This is a cleaner view than the split chart — it directly shows whether the options market is net bullish or bearish on far-OTM tails.")
 
             # ==========================================
