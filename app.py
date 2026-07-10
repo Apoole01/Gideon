@@ -1781,40 +1781,28 @@ with tab_signals:
             agg_call_sig = pd.DataFrame(columns=['date_str','notional_delta','Delta_3D_MA'])
             agg_put_sig_otm = pd.DataFrame(columns=['date_str','notional_delta','Delta_3D_MA'])
             agg_net_sig = pd.DataFrame(columns=['date_str','net_delta','Net_3D_MA'])
-            call_exp_pivot = pd.DataFrame()
-            put_exp_pivot = pd.DataFrame()
-            net_exp_pivot = pd.DataFrame()
-            exp_weeks = []
+            call_dte_pivot = pd.DataFrame()
+            put_dte_pivot = pd.DataFrame()
+            net_dte_pivot = pd.DataFrame()
 
             if not far_call_sig.empty:
                 far_call_sig['notional_delta'] = far_call_sig['delta'] * far_call_sig['open_interest'] * 100 * far_call_sig['underlying_price']
-                far_call_sig['exp_dt'] = pd.to_datetime(far_call_sig['expiration'])
-                far_call_sig['exp_week'] = far_call_sig['exp_dt'].dt.to_period('W-FRI').dt.end_time.dt.strftime('%b %d')
+                far_call_sig['dte_bucket'] = far_call_sig['dte'].apply(lambda d: '2-7 DTE' if d<=7 else ('8-15 DTE' if d<=15 else ('16-30 DTE' if d<=30 else ('31-45 DTE' if d<=45 else '46+ DTE'))))
                 agg_call_sig = far_call_sig.groupby('date_str')['notional_delta'].sum().reset_index()
                 agg_call_sig['Delta_3D_MA'] = agg_call_sig['notional_delta'].rolling(3, min_periods=1).mean()
                 # Pivot: date x expiration week
-                call_exp_pivot = far_call_sig.groupby(['date_str','exp_week'])['notional_delta'].sum().unstack(fill_value=0)
+                call_dte_pivot = far_call_sig.groupby(['date_str','dte_bucket'])['notional_delta'].sum().unstack(fill_value=0)
 
             if not far_put_sig.empty:
                 far_put_sig['notional_delta'] = far_put_sig['delta'].abs() * far_put_sig['open_interest'] * 100 * far_put_sig['underlying_price']
-                far_put_sig['exp_dt'] = pd.to_datetime(far_put_sig['expiration'])
-                far_put_sig['exp_week'] = far_put_sig['exp_dt'].dt.to_period('W-FRI').dt.end_time.dt.strftime('%b %d')
+                far_put_sig['dte_bucket'] = far_put_sig['dte'].apply(lambda d: '2-7 DTE' if d<=7 else ('8-15 DTE' if d<=15 else ('16-30 DTE' if d<=30 else ('31-45 DTE' if d<=45 else '46+ DTE'))))
                 agg_put_sig_otm = far_put_sig.groupby('date_str')['notional_delta'].sum().reset_index()
                 agg_put_sig_otm['Delta_3D_MA'] = agg_put_sig_otm['notional_delta'].rolling(3, min_periods=1).mean()
-                put_exp_pivot = far_put_sig.groupby(['date_str','exp_week'])['notional_delta'].sum().unstack(fill_value=0)
+                put_dte_pivot = far_put_sig.groupby(['date_str','dte_bucket'])['notional_delta'].sum().unstack(fill_value=0)
 
-            # All expiration weeks — keep top 5 by total notional, rest become "Other"
-            all_exp_weeks = sorted(list(set(list(call_exp_pivot.columns) if not call_exp_pivot.empty else []) | set(list(put_exp_pivot.columns) if not put_exp_pivot.empty else [])))
-            # Rank by total contribution
-            week_totals = {}
-            if not call_exp_pivot.empty:
-                for w in call_exp_pivot.columns: week_totals[w] = week_totals.get(w,0) + call_exp_pivot[w].sum()
-            if not put_exp_pivot.empty:
-                for w in put_exp_pivot.columns: week_totals[w] = week_totals.get(w,0) + put_exp_pivot[w].sum()
-            top_weeks = sorted(week_totals, key=week_totals.get, reverse=True)[:5]
-            other_weeks = [w for w in all_exp_weeks if w not in top_weeks]
-            display_weeks = top_weeks + (['Other'] if other_weeks else [])
-            exp_week_colors = ['#00CC96','#FECB52','#EF553B','#636EFA','#AB63FA','#888888']
+            # Fixed DTE bucket order (short-term -> long-term)
+            dte_buckets_order = ['2-7 DTE','8-15 DTE','16-30 DTE','31-45 DTE','46+ DTE']
+            dte_colors = ['#EF553B','#FFA15A','#FECB52','#00CC96','#636EFA']
 
             # Net notional delta (calls - puts) per expiration week
             if not far_call_sig.empty or not far_put_sig.empty:
@@ -1826,10 +1814,12 @@ with tab_signals:
                 net['Net_3D_MA'] = net['net_delta'].rolling(5, min_periods=2).mean()
                 net['nd_rising'] = net['Net_3D_MA'] > net['Net_3D_MA'].shift(1)
                 agg_net_sig = net
-                # Net per expiration week (calls - puts)
-                if not call_exp_pivot.empty or not put_exp_pivot.empty:
-                    net_exp_pivot = call_exp_pivot.reindex(columns=all_exp_weeks, fill_value=0) - put_exp_pivot.reindex(columns=all_exp_weeks, fill_value=0)
-                    net_exp_pivot = net_exp_pivot.reindex(sorted(net_exp_pivot.index), fill_value=0)
+                # Net per DTE bucket
+                if not call_dte_pivot.empty or not put_dte_pivot.empty:
+                    c_align = call_dte_pivot.reindex(columns=dte_buckets_order, fill_value=0) if not call_dte_pivot.empty else pd.DataFrame(0, index=put_dte_pivot.index, columns=dte_buckets_order)
+                    p_align = put_dte_pivot.reindex(columns=dte_buckets_order, fill_value=0) if not put_dte_pivot.empty else pd.DataFrame(0, index=call_dte_pivot.index, columns=dte_buckets_order)
+                    net_dte_pivot = c_align - p_align
+                    net_dte_pivot = net_dte_pivot.reindex(sorted(net_dte_pivot.index), fill_value=0)
 
             # For backward compat with M5 signal detection
             agg_far_sig = agg_call_sig.copy()
@@ -2101,37 +2091,35 @@ with tab_signals:
             with c_otm:
                 fig_s4 = make_subplots(specs=[[{"secondary_y": True}]])
 
-                # Merge other weeks into "Other" column for calls
-                call_plot = call_exp_pivot.copy() if not call_exp_pivot.empty else pd.DataFrame()
-                if not call_plot.empty and other_weeks:
-                    call_plot['Other'] = call_plot[other_weeks].sum(axis=1) if all(w in call_plot.columns for w in other_weeks) else call_plot[[w for w in other_weeks if w in call_plot.columns]].sum(axis=1)
-                call_plot = call_plot.reindex(sorted(call_plot.index), fill_value=0)
-
-                # Merge other weeks into "Other" column for puts
-                put_plot = put_exp_pivot.copy() if not put_exp_pivot.empty else pd.DataFrame()
-                if not put_plot.empty and other_weeks:
-                    put_plot['Other'] = put_plot[other_weeks].sum(axis=1) if all(w in put_plot.columns for w in other_weeks) else put_plot[[w for w in other_weeks if w in put_plot.columns]].sum(axis=1)
-                put_plot = put_plot.reindex(sorted(put_plot.index), fill_value=0)
-
-                # CALLS stacked (positive)
+                # CALLS stacked by DTE bucket (positive)
+                call_plot = call_dte_pivot.reindex(columns=[b for b in dte_buckets_order if b in call_dte_pivot.columns], fill_value=0) if not call_dte_pivot.empty else pd.DataFrame()
                 if not call_plot.empty:
-                    for wi, week in enumerate(display_weeks):
-                        if week in call_plot.columns:
-                            vals = call_plot[week]
+                    call_plot = call_plot.reindex(sorted(call_plot.index), fill_value=0)
+                    for wi, bucket in enumerate(dte_buckets_order):
+                        if bucket in call_plot.columns:
+                            vals = call_plot[bucket]
                             if vals.sum() > 0:
-                                color = exp_week_colors[wi % len(exp_week_colors)]
                                 fig_s4.add_trace(go.Bar(x=call_plot.index, y=vals,
-                                    name=f'Call {week}', marker_color=color, showlegend=True), secondary_y=False)
+                                    name=f'Call {bucket}', marker_color=dte_colors[wi], showlegend=True), secondary_y=False)
 
-                # PUTS stacked (negative)
+                # PUTS stacked by DTE bucket (negative)
+                put_plot = put_dte_pivot.reindex(columns=[b for b in dte_buckets_order if b in put_dte_pivot.columns], fill_value=0) if not put_dte_pivot.empty else pd.DataFrame()
                 if not put_plot.empty:
-                    for wi, week in enumerate(display_weeks):
-                        if week in put_plot.columns:
-                            vals = -put_plot[week]
+                    put_plot = put_plot.reindex(sorted(put_plot.index), fill_value=0)
+                    for wi, bucket in enumerate(dte_buckets_order):
+                        if bucket in put_plot.columns:
+                            vals = -put_plot[bucket]
                             if abs(vals).sum() > 0:
-                                color = exp_week_colors[wi % len(exp_week_colors)]
                                 fig_s4.add_trace(go.Bar(x=put_plot.index, y=vals,
-                                    name=f'Put {week}', marker_color=color, showlegend=True), secondary_y=False)
+                                    name=f'Put {bucket}', marker_color=dte_colors[wi], showlegend=True), secondary_y=False)
+
+                # 3D MA lines for total calls and puts
+                if not agg_call_sig.empty:
+                    fig_s4.add_trace(go.Scatter(x=agg_call_sig['date_str'], y=agg_call_sig['Delta_3D_MA'],
+                        mode='lines', line=dict(color='#00CC96', width=2), name='Calls 3D MA'), secondary_y=False)
+                if not agg_put_sig_otm.empty:
+                    fig_s4.add_trace(go.Scatter(x=agg_put_sig_otm['date_str'], y=-agg_put_sig_otm['Delta_3D_MA'],
+                        mode='lines', line=dict(color='#EF553B', width=2), name='Puts 3D MA'), secondary_y=False)
 
                 # Zero line
                 fig_s4.add_hline(y=0, line_color='white', line_width=1.5, opacity=0.5, secondary_y=False)
@@ -2148,7 +2136,7 @@ with tab_signals:
                 fig_s4.add_trace(go.Scatter(x=s_spot.index, y=s_spot.values, name="Spot Price", mode='lines',
                     line=dict(color='white', width=2, dash='dot')), secondary_y=True)
 
-                fig_s4.update_layout(title="4. Far-OTM (<10Δ) Notional Delta — Top 5 Exp Weeks",
+                fig_s4.update_layout(title="4. Far-OTM (<10Δ) Notional Delta — Calls vs Puts by DTE",
                     template='plotly_dark', barmode='relative', bargap=0,
                     height=350, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified',
                     legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center", font=dict(size=9)))
@@ -2157,33 +2145,27 @@ with tab_signals:
                 fig_s4.update_yaxes(showgrid=False, secondary_y=True)
                 st.plotly_chart(fig_s4, use_container_width=True)
             with c_otm_desc:
-                st.info("**Calls (above zero) vs Puts (below zero) — stacked by top 5 expiration weeks.**\n\n"
-                    "Each color = different expiration week. Remaining weeks combined into grey 'Other'.\n\n"
-                    "**White line** = zero split. **Yellow triangles** = M5 signal.")
+                st.info("**Calls (above zero) vs Puts (below zero) — stacked by DTE bucket.**\n\n"
+                    "Red=2-7d, Orange=8-15d, Yellow=16-30d, Green=31-45d, Blue=46+d. Short-term = more speculative.\n\n"
+                    "**Solid lines** = 3D MA for total calls (green) and puts (red). **White line** = zero split. **Yellow triangles** = M5 signal.")
 
             # ==========================================
-            # CHART 5: NET NOTIONAL DELTA by Expiration Week (Top 5)
+            # CHART 5: NET NOTIONAL DELTA by DTE Bucket
             # ==========================================
             st.divider()
             c_net, c_net_desc = st.columns([2, 1])
             with c_net:
                 fig_s5 = make_subplots(specs=[[{"secondary_y": True}]])
 
-                net_plot = net_exp_pivot.copy() if not net_exp_pivot.empty else pd.DataFrame()
-                if not net_plot.empty and other_weeks:
-                    avail_other = [w for w in other_weeks if w in net_plot.columns]
-                    if avail_other:
-                        net_plot['Other'] = net_plot[avail_other].sum(axis=1)
-                net_plot = net_plot.reindex(sorted(net_plot.index), fill_value=0)
-
+                net_plot = net_dte_pivot.reindex(columns=[b for b in dte_buckets_order if b in net_dte_pivot.columns], fill_value=0) if not net_dte_pivot.empty else pd.DataFrame()
                 if not net_plot.empty:
-                    for wi, week in enumerate(display_weeks):
-                        if week in net_plot.columns:
-                            vals = net_plot[week]
+                    net_plot = net_plot.reindex(sorted(net_plot.index), fill_value=0)
+                    for wi, bucket in enumerate(dte_buckets_order):
+                        if bucket in net_plot.columns:
+                            vals = net_plot[bucket]
                             if abs(vals).sum() > 0:
-                                color = exp_week_colors[wi % len(exp_week_colors)]
                                 fig_s5.add_trace(go.Bar(x=net_plot.index, y=vals,
-                                    name=f'{week}', marker_color=color, showlegend=True), secondary_y=False)
+                                    name=bucket, marker_color=dte_colors[wi], showlegend=True), secondary_y=False)
 
                 if not agg_net_sig.empty:
                     fig_s5.add_trace(go.Scatter(x=agg_net_sig['date_str'], y=agg_net_sig['Net_3D_MA'],
@@ -2193,7 +2175,7 @@ with tab_signals:
                 fig_s5.add_trace(go.Scatter(x=s_spot.index, y=s_spot.values, name="Spot Price", mode='lines',
                     line=dict(color='white', width=2, dash='dot')), secondary_y=True)
 
-                fig_s5.update_layout(title="5. Net Far-OTM Notional Delta (Calls − Puts) by Exp Week",
+                fig_s5.update_layout(title="5. Net Far-OTM Notional Delta (Calls − Puts) by DTE",
                     template='plotly_dark', barmode='relative', bargap=0,
                     height=350, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified',
                     legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center", font=dict(size=9)))
