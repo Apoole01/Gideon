@@ -111,7 +111,7 @@ def render_two_step_selector(unique_id, available_exps, is_multi=True):
 
 
 # --- DATA CONNECTION & CACHING ---
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=3600)
 def load_s3_data():
     load_dotenv()
     aws_key = os.getenv('AWS_ACCESS_KEY')
@@ -1111,19 +1111,23 @@ def compute_rotation_scores(df, comp_date):
     sec['delta'] = pd.to_numeric(sec['delta'], errors='coerce')
     sec['premium'] = sec['volume'] * sec['last_price'] * 100
 
-    # Get price data for relative strength
-    all_t = tickers + ['SPY']
+    # Get SPY prices from yfinance (single ticker, fast)
     try:
-        pdata = yf.download(all_t, start='2026-01-01', end=comp_date, progress=False)
+        spy_data = yf.download('SPY', start='2026-01-01', end=comp_date, progress=False)
+        spy = spy_data[('Close', 'SPY')].dropna() if not spy_data.empty else pd.Series()
     except:
-        return pd.DataFrame()
-
-    prices = {}
-    for t in all_t:
-        if ('Close', t) in pdata.columns:
-            prices[t] = pdata[('Close', t)].dropna()
-    spy = prices.get('SPY', pd.Series())
+        spy = pd.Series()
     if spy.empty: return pd.DataFrame()
+
+    # Use S3 chain underlying_price for sector ETFs (no network call needed)
+    prices = {}
+    for t in tickers:
+        t_px = df[(df['ticker'] == t) & (df['timestamp'] < comp_date)].drop_duplicates(subset=['timestamp'])
+        if not t_px.empty:
+            t_px = t_px.sort_values('timestamp')
+            t_px['date_dt'] = pd.to_datetime(t_px['timestamp']).dt.date
+            prices[t] = t_px.set_index('date_dt')['underlying_price'].dropna()
+    prices['SPY'] = spy
 
     # Front-month chain
     fm = sec[sec['dte'].between(7, 45)]
