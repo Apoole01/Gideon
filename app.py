@@ -1651,7 +1651,7 @@ with tab_stealth:
                 fig5.add_trace(go.Scatter(x=spot_hist.index, y=spot_hist.values, name="Spot Price", mode='lines',
                                           line=dict(color='white', width=2, dash='dot')), secondary_y=True)
 
-                fig5.update_layout(title="5. Far-OTM (<10Δ) Call Delta Expansion", template='plotly_dark', height=350,
+                fig5.update_layout(title="4. Far-OTM (<10Δ) Call Delta Expansion", template='plotly_dark', height=350,
                                    margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified')
                 fig5.update_xaxes(type='category', categoryorder='category ascending')
                 fig5.update_yaxes(title_text="Notional Delta ($)", secondary_y=False)
@@ -1758,6 +1758,7 @@ with tab_signals:
             df_vwks_sig['vwks_num'] = df_vwks_sig['strike'] * df_vwks_sig['volume']
             agg_vwks_sig = df_vwks_sig.groupby('date_str').apply(lambda x: (x['vwks_num'].sum() / x['volume'].sum()) if x['volume'].sum() > 0 else np.nan).rename('VWKS').reset_index()
             agg_vwks_sig['VWKS_3D_MA'] = agg_vwks_sig['VWKS'].rolling(3, min_periods=1).mean()
+            agg_vwks_sig['VWKS_5D_MA'] = agg_vwks_sig['VWKS'].rolling(5, min_periods=3).mean()
             agg_vwks_sig['spot_3d_ma'] = agg_vwks_sig['date_str'].map(spot_ma_sig)
             agg_vwks_sig['smooth_gap_pct'] = ((agg_vwks_sig['VWKS_3D_MA'] - agg_vwks_sig['spot_3d_ma']) / agg_vwks_sig['spot_3d_ma']) * 100
 
@@ -1766,6 +1767,7 @@ with tab_signals:
             df_put_sig['vwks_num_put'] = df_put_sig['strike'] * df_put_sig['volume']
             agg_put_sig = df_put_sig.groupby('date_str').apply(lambda x: (x['vwks_num_put'].sum() / x['volume'].sum()) if x['volume'].sum() > 0 else np.nan).rename('VWKS_PUT').reset_index()
             agg_put_sig['VWKS_PUT_3D'] = agg_put_sig['VWKS_PUT'].rolling(3, min_periods=1).mean()
+            agg_put_sig['VWKS_PUT_5D'] = agg_put_sig['VWKS_PUT'].rolling(5, min_periods=3).mean()
 
             # --- Compute Skew ---
             df_skew_sig = s_hist[(s_hist['dte'].between(7, 60)) & (s_hist['iv'] > 0) & (s_hist['iv'] < 2.0)]
@@ -2033,7 +2035,47 @@ with tab_signals:
                     "**Yellow diamonds** = M7 signal fires (Call up + Put down + spot not spiked). 56% historical hit rate at t10.")
 
             # ==========================================
-            # CHART 3: BACKWARDATION MAGNITUDE MONITOR
+            # CHART 3: PUT VWKS DIVERGENCE — 5D MA (Smoother)
+            # ==========================================
+            st.divider()
+            c_put5, c_put5_desc = st.columns([2, 1])
+            with c_put5:
+                fig_s3 = make_subplots(specs=[[{"secondary_y": False}]])
+
+                # Call VWKS 5D MA
+                fig_s3.add_trace(go.Scatter(x=agg_vwks_sig['date_str'], y=agg_vwks_sig['VWKS_5D_MA'],
+                    name="Call VWKS 5D MA", mode='lines+markers', line=dict(color='#00CC96', width=2.5)))
+                # Put VWKS 5D MA
+                if not agg_put_sig.empty:
+                    fig_s3.add_trace(go.Scatter(x=agg_put_sig['date_str'], y=agg_put_sig['VWKS_PUT_5D'],
+                        name="Put VWKS 5D MA", mode='lines+markers', line=dict(color='#EF553B', width=2.5)))
+
+                # M7 signal markers
+                if sig_m7_dates:
+                    m7_dates_list = sorted(sig_m7_dates)
+                    m7_fire5 = agg_vwks_sig[agg_vwks_sig['date_str'].isin(m7_dates_list)]
+                    if len(m7_fire5) > 0:
+                        fig_s3.add_trace(go.Scatter(x=m7_fire5['date_str'], y=m7_fire5['VWKS_5D_MA'],
+                            mode='markers', name='M7 Signal',
+                            marker=dict(color='#FECB52', size=12, symbol='diamond', line=dict(color='white', width=1))))
+
+                # Spot price
+                fig_s3.add_trace(go.Scatter(x=s_spot.index, y=s_spot.values, name="Spot Price", mode='lines',
+                    line=dict(color='white', width=2, dash='dot')))
+
+                fig_s3.update_layout(title="3. Put VWKS Divergence — 5-Day MA (Smoother Trend)", template='plotly_dark',
+                    height=350, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified',
+                    legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"))
+                fig_s3.update_xaxes(type='category', categoryorder='category ascending')
+                fig_s3.update_yaxes(title_text="Price ($)")
+                st.plotly_chart(fig_s3, use_container_width=True)
+            with c_put5_desc:
+                st.info("**Same as Chart 2, but smoothed with 5-day MA instead of 3-day.**\n\n"
+                    "Less noise, clearer trend. Green rising + red falling = accumulation. Yellow diamonds = M7 signal.\n\n"
+                    "Compare Charts 2 and 3 to see short-term vs medium-term VWKS divergence.")
+
+            # ==========================================
+            # CHART 4: BACKWARDATION MAGNITUDE MONITOR
             # ==========================================
             st.divider()
             c_bw, c_bw_desc = st.columns([2, 1])
@@ -2078,7 +2120,7 @@ with tab_signals:
                 fig_s3.add_trace(go.Scatter(x=s_spot.index, y=s_spot.values, name="Spot Price", mode='lines',
                     line=dict(color='white', width=2, dash='dot')), secondary_y=True)
 
-                fig_s3.update_layout(title="3. Backwardation Magnitude — Tier Monitor", template='plotly_dark',
+                fig_s3.update_layout(title="4. Backwardation Magnitude — Tier Monitor", template='plotly_dark',
                     height=350, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified',
                     legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"))
                 fig_s3.update_xaxes(type='category', categoryorder='category ascending')
@@ -2091,7 +2133,7 @@ with tab_signals:
                     "**Green triangles** = BW >= 2% signals. Higher magnitude (>3-5%) = higher returns but lower hit rate.")
 
             # ==========================================
-            # CHART 4: OTM DELTA — CALLS vs PUTS by Expiration Week (Top 5)
+            # CHART 5: OTM DELTA — CALLS vs PUTS by Expiration Week (Top 5)
             # ==========================================
             st.divider()
             c_otm, c_otm_desc = st.columns([2, 1])
@@ -2157,7 +2199,7 @@ with tab_signals:
                     "**Solid lines** = 3D MA for total calls (green) and puts (red). **White line** = zero split. **Yellow triangles** = M5 signal.")
 
             # ==========================================
-            # CHART 5: NET NOTIONAL DELTA by DTE Bucket
+            # CHART 6: NET NOTIONAL DELTA by DTE Bucket
             # ==========================================
             st.divider()
             c_net, c_net_desc = st.columns([2, 1])
@@ -2182,7 +2224,7 @@ with tab_signals:
                 fig_s5.add_trace(go.Scatter(x=s_spot.index, y=s_spot.values, name="Spot Price", mode='lines',
                     line=dict(color='white', width=2, dash='dot')), secondary_y=True)
 
-                fig_s5.update_layout(title="5. Net Far-OTM Notional Delta (Calls − Puts) by DTE",
+                fig_s5.update_layout(title="6. Net Far-OTM Notional Delta (Calls − Puts) by DTE",
                     template='plotly_dark', barmode='relative', bargap=0,
                     height=350, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified',
                     legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center", font=dict(size=9)))
@@ -2196,7 +2238,7 @@ with tab_signals:
                     "**Green line** = 5-day MA of total net delta. Above zero = net bullish, below = net bearish.")
 
             # ==========================================
-            # CHART 6: NET VOLUME by DTE Bucket
+            # CHART 7: NET VOLUME by DTE Bucket
             # ==========================================
             st.divider()
             c_vol, c_vol_desc = st.columns([2, 1])
@@ -2230,7 +2272,7 @@ with tab_signals:
                 fig_s6.add_trace(go.Scatter(x=s_spot.index, y=s_spot.values, name="Spot Price", mode='lines',
                     line=dict(color='white', width=2, dash='dot')), secondary_y=True)
 
-                fig_s6.update_layout(title="6. Net Far-OTM Volume (Calls − Puts) by DTE",
+                fig_s6.update_layout(title="7. Net Far-OTM Volume (Calls − Puts) by DTE",
                     template='plotly_dark', barmode='relative', bargap=0,
                     height=350, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified',
                     legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center", font=dict(size=9)))
@@ -2244,7 +2286,7 @@ with tab_signals:
                     "**Green line** = 5-day MA. Above zero = more call volume (speculation), below = more put volume (hedging).")
 
             # ==========================================
-            # CHART 7: NET OPEN INTEREST by DTE Bucket
+            # CHART 8: NET OPEN INTEREST by DTE Bucket
             # ==========================================
             st.divider()
             c_oi, c_oi_desc = st.columns([2, 1])
@@ -2276,7 +2318,7 @@ with tab_signals:
                 fig_s7.add_trace(go.Scatter(x=s_spot.index, y=s_spot.values, name="Spot Price", mode='lines',
                     line=dict(color='white', width=2, dash='dot')), secondary_y=True)
 
-                fig_s7.update_layout(title="7. Net Far-OTM Open Interest (Calls − Puts) by DTE",
+                fig_s7.update_layout(title="8. Net Far-OTM Open Interest (Calls − Puts) by DTE",
                     template='plotly_dark', barmode='relative', bargap=0,
                     height=350, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified',
                     legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center", font=dict(size=9)))
