@@ -1717,7 +1717,7 @@ with tab_signals:
     if len(sig_dates) == 0:
         st.warning("No historical data available.")
     else:
-        sig_start = sig_dates[-40] if len(sig_dates) >= 40 else sig_dates[0]
+        sig_start = sig_dates[-60] if len(sig_dates) >= 60 else sig_dates[0]
         sig_end = sig_dates[-1]
         sig_start_date, sig_end_date = st.select_slider(
             "Signal Detection Window:",
@@ -1810,9 +1810,8 @@ with tab_signals:
             sig_m3 = (agg_vwks_sig['smooth_gap_pct'] > gap_p90) & agg_vwks_sig['date_str'].map(spot_not_spiked).fillna(False)
             sig_m3_dates = set(agg_vwks_sig.loc[sig_m3.values, 'date_str']) if sig_m3.any() else set()
 
-            # Q1 filter: gap < 25th percentile of M3 signal gaps
-            m3_gaps = agg_vwks_sig.loc[sig_m3.values, 'smooth_gap_pct']
-            q1_threshold = m3_gaps.quantile(0.25) if len(m3_gaps) > 4 else gap_p90
+            # Q1 filter: gap < 6.35% (backtest-derived threshold across 61 tickers)
+            q1_threshold = 6.35
             sig_m3_q1 = sig_m3 & (agg_vwks_sig['smooth_gap_pct'] < q1_threshold)
             sig_m3_q1_dates = set(agg_vwks_sig.loc[sig_m3_q1.values, 'date_str']) if sig_m3_q1.any() else set()
 
