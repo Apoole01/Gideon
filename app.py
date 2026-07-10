@@ -1804,7 +1804,7 @@ with tab_signals:
             dte_buckets_order = ['2-7 DTE','8-15 DTE','16-30 DTE','31-45 DTE','46+ DTE']
             dte_colors = ['#EF553B','#FFA15A','#FECB52','#00CC96','#636EFA']
 
-            # Net notional delta (calls - puts) per expiration week
+            # Net notional delta (calls - puts) total + per DTE bucket
             if not far_call_sig.empty or not far_put_sig.empty:
                 # Total net
                 net = agg_call_sig[['date_str','notional_delta']].rename(columns={'notional_delta':'call_delta'}).merge(
@@ -2184,8 +2184,8 @@ with tab_signals:
                 fig_s5.update_yaxes(showgrid=False, secondary_y=True)
                 st.plotly_chart(fig_s5, use_container_width=True)
             with c_net_desc:
-                st.info("**Net = Calls minus Puts, stacked by top 5 expiration weeks.**\n\n"
-                    "Each color = different expiration week. Grey = all other weeks combined.\n\n"
+                st.info("**Net = Calls minus Puts, stacked by DTE bucket.**\n\n"
+                    "Red=2-7d, Orange=8-15d, Yellow=16-30d, Green=31-45d, Blue=46+d.\n\n"
                     "**Green line** = 5-day MA of total net delta. Above zero = net bullish, below = net bearish.")
 
             # ==========================================
