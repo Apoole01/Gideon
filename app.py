@@ -2099,7 +2099,7 @@ with tab_signals:
                     line=dict(color='white', width=2, dash='dot')), secondary_y=True)
 
                 fig_s4.update_layout(title="4. Far-OTM (<10Δ) Notional Delta — Calls vs Puts", template='plotly_dark',
-                    height=350, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified',
+                    height=350, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified', bargap=0,
                     legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"))
                 fig_s4.update_xaxes(type='category', categoryorder='category ascending')
                 fig_s4.update_yaxes(title_text="Notional Delta ($)", secondary_y=False)
