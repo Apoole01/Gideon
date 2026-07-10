@@ -1992,6 +1992,33 @@ with tab_signals:
                     "**Green stars** = Q1 signals (tradeable). **Red X** = Q2-4 signals (filtered — higher gap = lower quality).\n\n"
                     "**90th percentile line:** Gap threshold from 90-day rolling window. When gap crosses above with spot < 5% move = signal.")
 
+            # --- VWKS/SPOT gap highlights (for Charts 2 & 3) ---
+            # Yellow background when spot is within 2% of VWKS or has crossed over
+            if not agg_vwks_sig.empty and not agg_put_sig.empty and not s_spot.empty:
+                # Merge spot with call and put VWKS
+                spot_df = s_spot.reset_index(); spot_df.columns = ['date_str','spot']
+                gap_hl = agg_vwks_sig[['date_str','VWKS_3D_MA','VWKS_5D_MA']].merge(
+                    agg_put_sig[['date_str','VWKS_PUT_3D','VWKS_PUT_5D']], on='date_str', how='inner'
+                ).merge(spot_df, on='date_str', how='inner')
+                # Call gap % and put gap % for 3D
+                gap_hl['call_gap_3d'] = (gap_hl['spot'] - gap_hl['VWKS_3D_MA']) / gap_hl['spot'] * 100
+                gap_hl['put_gap_3d'] = (gap_hl['spot'] - gap_hl['VWKS_PUT_3D']) / gap_hl['spot'] * 100
+                gap_hl['call_gap_5d'] = (gap_hl['spot'] - gap_hl['VWKS_5D_MA']) / gap_hl['spot'] * 100
+                gap_hl['put_gap_5d'] = (gap_hl['spot'] - gap_hl['VWKS_PUT_5D']) / gap_hl['spot'] * 100
+                # Highlight: within 2% OR crossed over (call: spot>call VWKS, put: spot<put VWKS)
+                gap_hl['call_hl_3d'] = (gap_hl['call_gap_3d'].abs() < 2) | (gap_hl['spot'] > gap_hl['VWKS_3D_MA'])
+                gap_hl['put_hl_3d'] = (gap_hl['put_gap_3d'].abs() < 2) | (gap_hl['spot'] < gap_hl['VWKS_PUT_3D'])
+                gap_hl['call_hl_5d'] = (gap_hl['call_gap_5d'].abs() < 2) | (gap_hl['spot'] > gap_hl['VWKS_5D_MA'])
+                gap_hl['put_hl_5d'] = (gap_hl['put_gap_5d'].abs() < 2) | (gap_hl['spot'] < gap_hl['VWKS_PUT_5D'])
+                gap_hl['any_hl_3d'] = gap_hl['call_hl_3d'] | gap_hl['put_hl_3d']
+                gap_hl['any_hl_5d'] = gap_hl['call_hl_5d'] | gap_hl['put_hl_5d']
+                # Find contiguous blocks of highlighted dates for 3D and 5D
+                hl_dates_3d = gap_hl[gap_hl['any_hl_3d']]['date_str'].tolist()
+                hl_dates_5d = gap_hl[gap_hl['any_hl_5d']]['date_str'].tolist()
+            else:
+                hl_dates_3d = []
+                hl_dates_5d = []
+
             # ==========================================
             # CHART 2: PUT VWKS DIVERGENCE (NEW)
             # ==========================================
@@ -2021,6 +2048,10 @@ with tab_signals:
                 # Spot price (same axis as VWKS — all in dollars)
                 fig_s2.add_trace(go.Scatter(x=s_spot.index, y=s_spot.values, name="Spot Price", mode='lines',
                     line=dict(color='white', width=2, dash='dot')), secondary_y=False)
+
+                # Yellow highlight: days where spot is within 2% of VWKS or has crossed over
+                for d in hl_dates_3d:
+                    fig_s2.add_vrect(x0=d, x1=d, fillcolor="yellow", opacity=0.15, line_width=0, layer="below")
 
                 fig_s2.update_layout(title="2. Put VWKS Divergence — Dual Accumulation Check", template='plotly_dark',
                     height=350, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified',
@@ -2062,6 +2093,10 @@ with tab_signals:
                 # Spot price
                 fig_s3.add_trace(go.Scatter(x=s_spot.index, y=s_spot.values, name="Spot Price", mode='lines',
                     line=dict(color='white', width=2, dash='dot')))
+
+                # Yellow highlight: days where spot is within 2% of VWKS or has crossed over (5D version)
+                for d in hl_dates_5d:
+                    fig_s3.add_vrect(x0=d, x1=d, fillcolor="yellow", opacity=0.15, line_width=0, layer="below")
 
                 fig_s3.update_layout(title="3. Put VWKS Divergence — 5-Day MA (Smoother Trend)", template='plotly_dark',
                     height=350, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified',
