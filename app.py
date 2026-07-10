@@ -1774,26 +1774,42 @@ with tab_signals:
             skew_sig = ((calls_25_sig - puts_25_sig) * 100).rename("Skew").reset_index()
             skew_sig['Skew_3D_MA'] = skew_sig['Skew'].rolling(3, min_periods=1).mean()
 
-            # --- Compute OTM Delta (CALLS + PUTS) ---
+            # --- Compute OTM Delta (CALLS + PUTS) with expiration week breakdown ---
             far_call_sig = s_hist[(s_hist['side'] == 'CALL') & (s_hist['delta'] > 0) & (s_hist['delta'] <= 0.10) & (s_hist['dte'] > 2)].copy()
             far_put_sig = s_hist[(s_hist['side'] == 'PUT') & (s_hist['delta'] < 0) & (s_hist['delta'] >= -0.10) & (s_hist['dte'] > 2)].copy()
 
             agg_call_sig = pd.DataFrame(columns=['date_str','notional_delta','Delta_3D_MA'])
             agg_put_sig_otm = pd.DataFrame(columns=['date_str','notional_delta','Delta_3D_MA'])
             agg_net_sig = pd.DataFrame(columns=['date_str','net_delta','Net_3D_MA'])
+            call_exp_pivot = pd.DataFrame()
+            put_exp_pivot = pd.DataFrame()
+            net_exp_pivot = pd.DataFrame()
+            exp_weeks = []
 
             if not far_call_sig.empty:
                 far_call_sig['notional_delta'] = far_call_sig['delta'] * far_call_sig['open_interest'] * 100 * far_call_sig['underlying_price']
+                far_call_sig['exp_dt'] = pd.to_datetime(far_call_sig['expiration'])
+                far_call_sig['exp_week'] = far_call_sig['exp_dt'].dt.to_period('W-FRI').dt.end_time.dt.strftime('%b %d')
                 agg_call_sig = far_call_sig.groupby('date_str')['notional_delta'].sum().reset_index()
                 agg_call_sig['Delta_3D_MA'] = agg_call_sig['notional_delta'].rolling(3, min_periods=1).mean()
+                # Pivot: date x expiration week
+                call_exp_pivot = far_call_sig.groupby(['date_str','exp_week'])['notional_delta'].sum().unstack(fill_value=0)
 
             if not far_put_sig.empty:
                 far_put_sig['notional_delta'] = far_put_sig['delta'].abs() * far_put_sig['open_interest'] * 100 * far_put_sig['underlying_price']
+                far_put_sig['exp_dt'] = pd.to_datetime(far_put_sig['expiration'])
+                far_put_sig['exp_week'] = far_put_sig['exp_dt'].dt.to_period('W-FRI').dt.end_time.dt.strftime('%b %d')
                 agg_put_sig_otm = far_put_sig.groupby('date_str')['notional_delta'].sum().reset_index()
                 agg_put_sig_otm['Delta_3D_MA'] = agg_put_sig_otm['notional_delta'].rolling(3, min_periods=1).mean()
+                put_exp_pivot = far_put_sig.groupby(['date_str','exp_week'])['notional_delta'].sum().unstack(fill_value=0)
 
-            # Net notional delta (calls - puts)
-            if not agg_call_sig.empty or not agg_put_sig_otm.empty:
+            # All expiration weeks across calls + puts
+            all_exp_weeks = sorted(list(set(list(call_exp_pivot.columns) if not call_exp_pivot.empty else []) | set(list(put_exp_pivot.columns) if not put_exp_pivot.empty else [])))
+            exp_week_colors = ['#00CC96','#FECB52','#EF553B','#636EFA','#AB63FA','#FFA15A','#19D3F3','#FF6692','#B6E880','#FF97FF']
+
+            # Net notional delta (calls - puts) per expiration week
+            if not far_call_sig.empty or not far_put_sig.empty:
+                # Total net
                 net = agg_call_sig[['date_str','notional_delta']].rename(columns={'notional_delta':'call_delta'}).merge(
                     agg_put_sig_otm[['date_str','notional_delta']].rename(columns={'notional_delta':'put_delta'}),
                     on='date_str', how='outer').fillna(0).sort_values('date_str')
@@ -1801,6 +1817,10 @@ with tab_signals:
                 net['Net_3D_MA'] = net['net_delta'].rolling(5, min_periods=2).mean()
                 net['nd_rising'] = net['Net_3D_MA'] > net['Net_3D_MA'].shift(1)
                 agg_net_sig = net
+                # Net per expiration week (calls - puts)
+                if not call_exp_pivot.empty or not put_exp_pivot.empty:
+                    net_exp_pivot = call_exp_pivot.reindex(columns=all_exp_weeks, fill_value=0) - put_exp_pivot.reindex(columns=all_exp_weeks, fill_value=0)
+                    net_exp_pivot = net_exp_pivot.reindex(sorted(net_exp_pivot.index), fill_value=0)
 
             # For backward compat with M5 signal detection
             agg_far_sig = agg_call_sig.copy()
@@ -2065,28 +2085,38 @@ with tab_signals:
                     "**Green triangles** = BW >= 2% signals. Higher magnitude (>3-5%) = higher returns but lower hit rate.")
 
             # ==========================================
-            # CHART 4: OTM DELTA — CALLS vs PUTS (Split View)
+            # CHART 4: OTM DELTA — CALLS vs PUTS by Expiration Week (Stacked)
             # ==========================================
             st.divider()
             c_otm, c_otm_desc = st.columns([2, 1])
             with c_otm:
                 fig_s4 = make_subplots(specs=[[{"secondary_y": True}]])
 
-                # Calls (green, positive)
-                if not agg_call_sig.empty:
-                    fig_s4.add_trace(go.Bar(x=agg_call_sig['date_str'], y=agg_call_sig['notional_delta'],
-                        marker_color='rgba(0, 204, 150, 0.35)', name='Calls <10Δ'), secondary_y=False)
-                    fig_s4.add_trace(go.Scatter(x=agg_call_sig['date_str'], y=agg_call_sig['Delta_3D_MA'],
-                        mode='lines', line=dict(color='#00CC96', width=2), name='Calls 3D MA'), secondary_y=False)
+                # CALLS stacked by expiration week (positive, green family)
+                if not call_exp_pivot.empty:
+                    call_exp_pivot = call_exp_pivot.reindex(sorted(call_exp_pivot.index), fill_value=0)
+                    for wi, week in enumerate(all_exp_weeks):
+                        if week in call_exp_pivot.columns:
+                            vals = call_exp_pivot[week]
+                            if vals.sum() > 0:
+                                color = exp_week_colors[wi % len(exp_week_colors)]
+                                fig_s4.add_trace(go.Bar(x=call_exp_pivot.index, y=vals,
+                                    name=f'Call {week}', marker_color=color,
+                                    legendgroup=f'call_{week}', showlegend=True), secondary_y=False)
 
-                # Puts (red, shown as negative for visual contrast)
-                if not agg_put_sig_otm.empty:
-                    fig_s4.add_trace(go.Bar(x=agg_put_sig_otm['date_str'], y=-agg_put_sig_otm['notional_delta'],
-                        marker_color='rgba(239, 85, 59, 0.35)', name='Puts <10Δ (neg)', base=None), secondary_y=False)
-                    fig_s4.add_trace(go.Scatter(x=agg_put_sig_otm['date_str'], y=-agg_put_sig_otm['Delta_3D_MA'],
-                        mode='lines', line=dict(color='#EF553B', width=2), name='Puts 3D MA (neg)'), secondary_y=False)
+                # PUTS stacked by expiration week (negative, red family)
+                if not put_exp_pivot.empty:
+                    put_exp_pivot = put_exp_pivot.reindex(sorted(put_exp_pivot.index), fill_value=0)
+                    for wi, week in enumerate(all_exp_weeks):
+                        if week in put_exp_pivot.columns:
+                            vals = -put_exp_pivot[week]  # negative for visual
+                            if abs(vals).sum() > 0:
+                                color = exp_week_colors[wi % len(exp_week_colors)]
+                                fig_s4.add_trace(go.Bar(x=put_exp_pivot.index, y=vals,
+                                    name=f'Put {week}', marker_color=color,
+                                    legendgroup=f'put_{week}', showlegend=True), secondary_y=False)
 
-                # M5 signal markers on calls MA
+                # M5 signal markers on calls total MA
                 if sig_m5_dates and not agg_call_sig.empty:
                     m5_fire = agg_call_sig[agg_call_sig['date_str'].isin(sig_m5_dates)]
                     if len(m5_fire) > 0:
@@ -2098,30 +2128,38 @@ with tab_signals:
                 fig_s4.add_trace(go.Scatter(x=s_spot.index, y=s_spot.values, name="Spot Price", mode='lines',
                     line=dict(color='white', width=2, dash='dot')), secondary_y=True)
 
-                fig_s4.update_layout(title="4. Far-OTM (<10Δ) Notional Delta — Calls vs Puts", template='plotly_dark',
-                    height=350, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified', bargap=0,
-                    legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"))
+                fig_s4.update_layout(title="4. Far-OTM (<10Δ) Notional Delta — Calls vs Puts by Exp Week",
+                    template='plotly_dark', barmode='relative', bargap=0,
+                    height=350, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified',
+                    legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center", font=dict(size=9)))
                 fig_s4.update_xaxes(type='category', categoryorder='category ascending')
                 fig_s4.update_yaxes(title_text="Notional Delta ($)", secondary_y=False)
                 fig_s4.update_yaxes(showgrid=False, secondary_y=True)
                 st.plotly_chart(fig_s4, use_container_width=True)
             with c_otm_desc:
-                st.info("**Calls (green) vs Puts (red) — far-OTM notional delta.**\n\n"
-                    "Puts are displayed as negative for visual contrast. When green bars dominate = bullish speculation. When red bars dominate = bearish hedging.\n\n"
-                    "**Solid lines** = 3-day moving average. **Yellow triangles** = M5 signal (calls 3D MA rising + spot not spiked).")
+                st.info("**Calls (above) vs Puts (below) — stacked by expiration week.**\n\n"
+                    "Each color = a different expiration week. Tall green stacks = heavy call speculation. Tall red stacks = heavy put hedging.\n\n"
+                    "**Yellow triangles** = M5 signal (calls 3D MA rising + spot not spiked).")
 
             # ==========================================
-            # CHART 5: NET NOTIONAL DELTA (Calls — Puts)
+            # CHART 5: NET NOTIONAL DELTA by Expiration Week (Stacked)
             # ==========================================
             st.divider()
             c_net, c_net_desc = st.columns([2, 1])
             with c_net:
                 fig_s5 = make_subplots(specs=[[{"secondary_y": True}]])
 
+                if not net_exp_pivot.empty:
+                    for wi, week in enumerate(all_exp_weeks):
+                        if week in net_exp_pivot.columns:
+                            vals = net_exp_pivot[week]
+                            if abs(vals).sum() > 0:
+                                color = exp_week_colors[wi % len(exp_week_colors)]
+                                fig_s5.add_trace(go.Bar(x=net_exp_pivot.index, y=vals,
+                                    name=f'{week}', marker_color=color, showlegend=True), secondary_y=False)
+
+                # Net 5D MA overlay
                 if not agg_net_sig.empty:
-                    colors_net = ['rgba(0,204,150,0.5)' if v >= 0 else 'rgba(239,85,59,0.5)' for v in agg_net_sig['net_delta']]
-                    fig_s5.add_trace(go.Bar(x=agg_net_sig['date_str'], y=agg_net_sig['net_delta'],
-                        marker_color=colors_net, name='Net Delta (Calls - Puts)'), secondary_y=False)
                     fig_s5.add_trace(go.Scatter(x=agg_net_sig['date_str'], y=agg_net_sig['Net_3D_MA'],
                         mode='lines', line=dict(color='#00CC96', width=2.5), name='Net 5D MA'), secondary_y=False)
                     fig_s5.add_hline(y=0, line_color='white', line_width=1, opacity=0.4, secondary_y=False)
@@ -2129,18 +2167,18 @@ with tab_signals:
                 fig_s5.add_trace(go.Scatter(x=s_spot.index, y=s_spot.values, name="Spot Price", mode='lines',
                     line=dict(color='white', width=2, dash='dot')), secondary_y=True)
 
-                fig_s5.update_layout(title="5. Net Far-OTM Notional Delta (Calls — Puts)", template='plotly_dark',
+                fig_s5.update_layout(title="5. Net Far-OTM Notional Delta (Calls − Puts) by Exp Week",
+                    template='plotly_dark', barmode='relative', bargap=0,
                     height=350, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified',
-                    legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"))
+                    legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center", font=dict(size=9)))
                 fig_s5.update_xaxes(type='category', categoryorder='category ascending')
                 fig_s5.update_yaxes(title_text="Net Notional Delta ($)", secondary_y=False)
                 fig_s5.update_yaxes(showgrid=False, secondary_y=True)
                 st.plotly_chart(fig_s5, use_container_width=True)
             with c_net_desc:
-                st.info("**Net notional delta = Calls minus Puts.**\n\n"
-                    "**Green bars** = calls > puts (bullish speculation dominates). **Red bars** = puts > calls (bearish hedging dominates).\n\n"
-                    "**White line** = 5-day moving average of net delta. Rising = speculative flow building. Falling = hedging increasing.\n\n"
-                    "This is a cleaner view than the split chart — it directly shows whether the options market is net bullish or bearish on far-OTM tails.")
+                st.info("**Net notional delta = Calls minus Puts, stacked by expiration week.**\n\n"
+                    "Each color = different expiration week. Above zero = net bullish. Below zero = net bearish.\n\n"
+                    "**Green line** = 5-day moving average of total net delta. Rising = speculative flow building.")
 
             # ==========================================
             # SIGNAL LOG TABLE
