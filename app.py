@@ -1808,6 +1808,10 @@ with tab_signals:
             call_vol_pivot = far_call_sig.groupby(['date_str','dte_bucket'])['volume'].sum().unstack(fill_value=0) if 'dte_bucket' in far_call_sig.columns else pd.DataFrame()
             put_vol_pivot = far_put_sig.groupby(['date_str','dte_bucket'])['volume'].sum().unstack(fill_value=0) if 'dte_bucket' in far_put_sig.columns else pd.DataFrame()
 
+            # OI-based pivots
+            call_oi_pivot = far_call_sig.groupby(['date_str','dte_bucket'])['open_interest'].sum().unstack(fill_value=0) if 'dte_bucket' in far_call_sig.columns else pd.DataFrame()
+            put_oi_pivot = far_put_sig.groupby(['date_str','dte_bucket'])['open_interest'].sum().unstack(fill_value=0) if 'dte_bucket' in far_put_sig.columns else pd.DataFrame()
+
             # Net notional delta (calls - puts) total + per DTE bucket
             if not far_call_sig.empty or not far_put_sig.empty:
                 # Total net
@@ -2239,6 +2243,52 @@ with tab_signals:
                 st.info("**Net Volume = Call volume minus Put volume for far-OTM options, stacked by DTE.**\n\n"
                     "Unlike notional delta, volume is not inflated by time premium — it's a cleaner measure of raw activity.\n\n"
                     "**Green line** = 5-day MA. Above zero = more call volume (speculation), below = more put volume (hedging).")
+
+            # ==========================================
+            # CHART 7: NET OPEN INTEREST by DTE Bucket
+            # ==========================================
+            st.divider()
+            c_oi, c_oi_desc = st.columns([2, 1])
+            with c_oi:
+                fig_s7 = make_subplots(specs=[[{"secondary_y": True}]])
+
+                oi_net_pivot = pd.DataFrame()
+                if not call_oi_pivot.empty or not put_oi_pivot.empty:
+                    co = call_oi_pivot.reindex(columns=[b for b in dte_buckets_order if b in call_oi_pivot.columns], fill_value=0) if not call_oi_pivot.empty else pd.DataFrame(0, index=put_oi_pivot.index, columns=[b for b in dte_buckets_order if b in put_oi_pivot.columns])
+                    po = put_oi_pivot.reindex(columns=[b for b in dte_buckets_order if b in put_oi_pivot.columns], fill_value=0) if not put_oi_pivot.empty else pd.DataFrame(0, index=call_oi_pivot.index, columns=[b for b in dte_buckets_order if b in call_oi_pivot.columns])
+                    oi_net_pivot = co - po
+                    oi_net_pivot = oi_net_pivot.reindex(sorted(oi_net_pivot.index), fill_value=0)
+
+                if not oi_net_pivot.empty:
+                    for wi, bucket in enumerate(dte_buckets_order):
+                        if bucket in oi_net_pivot.columns:
+                            vals = oi_net_pivot[bucket]
+                            if abs(vals).sum() > 0:
+                                fig_s7.add_trace(go.Bar(x=oi_net_pivot.index, y=vals,
+                                    name=bucket, marker_color=dte_colors[wi], showlegend=True), secondary_y=False)
+
+                if not oi_net_pivot.empty:
+                    total_oi = oi_net_pivot.sum(axis=1)
+                    oi_5d = total_oi.rolling(5, min_periods=2).mean()
+                    fig_s7.add_trace(go.Scatter(x=total_oi.index, y=oi_5d,
+                        mode='lines', line=dict(color='#00CC96', width=2.5), name='OI 5D MA'), secondary_y=False)
+                    fig_s7.add_hline(y=0, line_color='white', line_width=1, opacity=0.4, secondary_y=False)
+
+                fig_s7.add_trace(go.Scatter(x=s_spot.index, y=s_spot.values, name="Spot Price", mode='lines',
+                    line=dict(color='white', width=2, dash='dot')), secondary_y=True)
+
+                fig_s7.update_layout(title="7. Net Far-OTM Open Interest (Calls − Puts) by DTE",
+                    template='plotly_dark', barmode='relative', bargap=0,
+                    height=350, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified',
+                    legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center", font=dict(size=9)))
+                fig_s7.update_xaxes(type='category', categoryorder='category ascending')
+                fig_s7.update_yaxes(title_text="Net Open Interest", secondary_y=False)
+                fig_s7.update_yaxes(showgrid=False, secondary_y=True)
+                st.plotly_chart(fig_s7, use_container_width=True)
+            with c_oi_desc:
+                st.info("**Net OI = Call OI minus Put OI for far-OTM options, stacked by DTE.**\n\n"
+                    "OI represents structural positioning (not daily flow). Changes here reflect shifts in longer-term conviction.\n\n"
+                    "**Green line** = 5-day MA. Above zero = more call OI (bullish positioning), below = more put OI (bearish positioning).")
 
             # ==========================================
             # SIGNAL LOG TABLE
