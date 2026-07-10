@@ -2030,8 +2030,8 @@ with tab_signals:
                 # Yellow background bars first (render behind everything)
                 all_dates_c2 = sorted(set(agg_vwks_sig['date_str']))
                 hl_mask_c2 = [d in hl_dates_3d for d in all_dates_c2]
-                y_min_c2 = min(agg_vwks_sig['VWKS_3D_MA'].min(), agg_put_sig['VWKS_PUT_3D'].min(), s_spot.min()) * 0.98
-                y_max_c2 = max(agg_vwks_sig['VWKS_3D_MA'].max(), agg_put_sig['VWKS_PUT_3D'].max(), s_spot.max()) * 1.02
+                y_min_c2 = min(agg_vwks_sig['VWKS_3D_MA'].min(), agg_put_sig['VWKS_PUT_3D'].min()) * 0.98
+                y_max_c2 = max(agg_vwks_sig['VWKS_3D_MA'].max(), agg_put_sig['VWKS_PUT_3D'].max()) * 1.02
                 fig_s2.add_trace(go.Bar(x=all_dates_c2, y=[y_max_c2]*len(all_dates_c2),
                     base=[y_min_c2]*len(all_dates_c2),
                     marker_color=['rgba(255,255,0,0.18)' if m else 'rgba(0,0,0,0)' for m in hl_mask_c2],
@@ -2063,7 +2063,7 @@ with tab_signals:
                     height=350, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified',
                     legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"))
                 fig_s2.update_xaxes(type='category', categoryorder='category ascending')
-                fig_s2.update_yaxes(title_text="Price ($)", secondary_y=False)
+                fig_s2.update_yaxes(title_text="Price ($)", secondary_y=False, range=[y_min_c2, y_max_c2])
                 st.plotly_chart(fig_s2, use_container_width=True)
             with c_put_desc:
                 st.info("**NEW — Backtest Validated:** M7 (Call VWKS up + Put VWKS down) beats M1 by **6% hit rate**.\n\n"
@@ -2082,8 +2082,8 @@ with tab_signals:
                 # Yellow background bars first (render behind everything)
                 all_dates_c3 = sorted(set(agg_vwks_sig['date_str']))
                 hl_mask_c3 = [d in hl_dates_5d for d in all_dates_c3]
-                y_min_c3 = min(agg_vwks_sig['VWKS_5D_MA'].min(), agg_put_sig['VWKS_PUT_5D'].min(), s_spot.min()) * 0.98
-                y_max_c3 = max(agg_vwks_sig['VWKS_5D_MA'].max(), agg_put_sig['VWKS_PUT_5D'].max(), s_spot.max()) * 1.02
+                y_min_c3 = min(agg_vwks_sig['VWKS_5D_MA'].min(), agg_put_sig['VWKS_PUT_5D'].min()) * 0.98
+                y_max_c3 = max(agg_vwks_sig['VWKS_5D_MA'].max(), agg_put_sig['VWKS_PUT_5D'].max()) * 1.02
                 fig_s3.add_trace(go.Bar(x=all_dates_c3, y=[y_max_c3]*len(all_dates_c3),
                     base=[y_min_c3]*len(all_dates_c3),
                     marker_color=['rgba(255,255,0,0.18)' if m else 'rgba(0,0,0,0)' for m in hl_mask_c3],
@@ -2114,7 +2114,7 @@ with tab_signals:
                     height=350, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified',
                     legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"))
                 fig_s3.update_xaxes(type='category', categoryorder='category ascending')
-                fig_s3.update_yaxes(title_text="Price ($)")
+                fig_s3.update_yaxes(title_text="Price ($)", range=[y_min_c3, y_max_c3])
                 st.plotly_chart(fig_s3, use_container_width=True)
             with c_put5_desc:
                 st.info("**Same as Chart 2, but smoothed with 5-day MA instead of 3-day.**\n\n"
