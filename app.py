@@ -1804,6 +1804,10 @@ with tab_signals:
             dte_buckets_order = ['2-7 DTE','8-15 DTE','16-30 DTE','31-45 DTE','46+ DTE']
             dte_colors = ['#EF553B','#FFA15A','#FECB52','#00CC96','#636EFA']
 
+            # Volume-based pivots (same DTE buckets, using raw volume instead of notional delta)
+            call_vol_pivot = far_call_sig.groupby(['date_str','dte_bucket'])['volume'].sum().unstack(fill_value=0) if 'dte_bucket' in far_call_sig.columns else pd.DataFrame()
+            put_vol_pivot = far_put_sig.groupby(['date_str','dte_bucket'])['volume'].sum().unstack(fill_value=0) if 'dte_bucket' in far_put_sig.columns else pd.DataFrame()
+
             # Net notional delta (calls - puts) total + per DTE bucket
             if not far_call_sig.empty or not far_put_sig.empty:
                 # Total net
@@ -2187,6 +2191,54 @@ with tab_signals:
                 st.info("**Net = Calls minus Puts, stacked by DTE bucket.**\n\n"
                     "Red=2-7d, Orange=8-15d, Yellow=16-30d, Green=31-45d, Blue=46+d.\n\n"
                     "**Green line** = 5-day MA of total net delta. Above zero = net bullish, below = net bearish.")
+
+            # ==========================================
+            # CHART 6: NET VOLUME by DTE Bucket
+            # ==========================================
+            st.divider()
+            c_vol, c_vol_desc = st.columns([2, 1])
+            with c_vol:
+                fig_s6 = make_subplots(specs=[[{"secondary_y": True}]])
+
+                # Net volume pivot
+                vol_net_pivot = pd.DataFrame()
+                if not call_vol_pivot.empty or not put_vol_pivot.empty:
+                    cv = call_vol_pivot.reindex(columns=[b for b in dte_buckets_order if b in call_vol_pivot.columns], fill_value=0) if not call_vol_pivot.empty else pd.DataFrame(0, index=put_vol_pivot.index, columns=[b for b in dte_buckets_order if b in put_vol_pivot.columns])
+                    pv = put_vol_pivot.reindex(columns=[b for b in dte_buckets_order if b in put_vol_pivot.columns], fill_value=0) if not put_vol_pivot.empty else pd.DataFrame(0, index=call_vol_pivot.index, columns=[b for b in dte_buckets_order if b in call_vol_pivot.columns])
+                    vol_net_pivot = cv - pv
+                    vol_net_pivot = vol_net_pivot.reindex(sorted(vol_net_pivot.index), fill_value=0)
+
+                if not vol_net_pivot.empty:
+                    for wi, bucket in enumerate(dte_buckets_order):
+                        if bucket in vol_net_pivot.columns:
+                            vals = vol_net_pivot[bucket]
+                            if abs(vals).sum() > 0:
+                                fig_s6.add_trace(go.Bar(x=vol_net_pivot.index, y=vals,
+                                    name=bucket, marker_color=dte_colors[wi], showlegend=True), secondary_y=False)
+
+                # 5D MA of total net volume
+                if not vol_net_pivot.empty:
+                    total_vol = vol_net_pivot.sum(axis=1)
+                    vol_5d = total_vol.rolling(5, min_periods=2).mean()
+                    fig_s6.add_trace(go.Scatter(x=total_vol.index, y=vol_5d,
+                        mode='lines', line=dict(color='#00CC96', width=2.5), name='Volume 5D MA'), secondary_y=False)
+                    fig_s6.add_hline(y=0, line_color='white', line_width=1, opacity=0.4, secondary_y=False)
+
+                fig_s6.add_trace(go.Scatter(x=s_spot.index, y=s_spot.values, name="Spot Price", mode='lines',
+                    line=dict(color='white', width=2, dash='dot')), secondary_y=True)
+
+                fig_s6.update_layout(title="6. Net Far-OTM Volume (Calls − Puts) by DTE",
+                    template='plotly_dark', barmode='relative', bargap=0,
+                    height=350, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified',
+                    legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center", font=dict(size=9)))
+                fig_s6.update_xaxes(type='category', categoryorder='category ascending')
+                fig_s6.update_yaxes(title_text="Net Volume", secondary_y=False)
+                fig_s6.update_yaxes(showgrid=False, secondary_y=True)
+                st.plotly_chart(fig_s6, use_container_width=True)
+            with c_vol_desc:
+                st.info("**Net Volume = Call volume minus Put volume for far-OTM options, stacked by DTE.**\n\n"
+                    "Unlike notional delta, volume is not inflated by time premium — it's a cleaner measure of raw activity.\n\n"
+                    "**Green line** = 5-day MA. Above zero = more call volume (speculation), below = more put volume (hedging).")
 
             # ==========================================
             # SIGNAL LOG TABLE
