@@ -2016,16 +2016,15 @@ with tab_signals:
                             marker=dict(color='#FECB52', size=12, symbol='diamond', line=dict(color='white', width=1))),
                             secondary_y=False)
 
-                # Spot price
+                # Spot price (same axis as VWKS — all in dollars)
                 fig_s2.add_trace(go.Scatter(x=s_spot.index, y=s_spot.values, name="Spot Price", mode='lines',
-                    line=dict(color='white', width=2, dash='dot')), secondary_y=True)
+                    line=dict(color='white', width=2, dash='dot')), secondary_y=False)
 
                 fig_s2.update_layout(title="2. Put VWKS Divergence — Dual Accumulation Check", template='plotly_dark',
                     height=350, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified',
                     legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"))
                 fig_s2.update_xaxes(type='category', categoryorder='category ascending')
-                fig_s2.update_yaxes(title_text="Strike ($)", secondary_y=False)
-                fig_s2.update_yaxes(showgrid=False, secondary_y=True)
+                fig_s2.update_yaxes(title_text="Price ($)", secondary_y=False)
                 st.plotly_chart(fig_s2, use_container_width=True)
             with c_put_desc:
                 st.info("**NEW — Backtest Validated:** M7 (Call VWKS up + Put VWKS down) beats M1 by **6% hit rate**.\n\n"
