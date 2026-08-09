@@ -67,11 +67,30 @@ if 'saved_months' not in st.session_state: st.session_state.saved_months = {}
 if 'saved_exps' not in st.session_state: st.session_state.saved_exps = {}
 
 
+
 def render_two_step_selector(unique_id, available_exps, is_multi=True):
     if not available_exps: return [] if is_multi else None
+    
+    # Calculate Current Week Exps
+    try:
+        sel_dt = pd.to_datetime(selected_date)
+        friday_dt = sel_dt + pd.Timedelta(days=(4 - sel_dt.weekday()))
+        friday_str = friday_dt.strftime('%Y-%m-%d')
+        cw_name = f"Current Week (End {friday_str})"
+        
+        week_start = sel_dt - pd.Timedelta(days=sel_dt.weekday())
+        week_end = week_start + pd.Timedelta(days=4)
+        cw_exps = [e for e in available_exps if pd.to_datetime(e) > sel_dt + pd.Timedelta(days=1) and week_start <= pd.to_datetime(e) <= week_end]
+    except:
+        cw_name = None
+        cw_exps = []
+        
     months = sorted(list(set([e[:7] for e in available_exps])))
+    if not is_multi and cw_exps:
+        months = [cw_name] + months
+        
     saved_m = st.session_state.saved_months.get(unique_id)
-
+    
     col_m, col_e = st.columns([1, 2])
     with col_m:
         if is_multi:
@@ -79,18 +98,20 @@ def render_two_step_selector(unique_id, available_exps, is_multi=True):
             valid_m_defaults = [m for m in saved_m if m in months]
             if not valid_m_defaults and months: valid_m_defaults = [months[0]]
             sel_m = st.multiselect("Filter by Month(s):", months, default=valid_m_defaults,
-                                   format_func=lambda x: pd.to_datetime(x).strftime('%B %Y'), key=f"m_{unique_id}")
+                                   format_func=lambda x: pd.to_datetime(x).strftime('%B %Y') if '-' in x else x, key=f"m_{unique_id}")
         else:
             m_index = months.index(saved_m) if saved_m in months else 0
             sel_m = st.selectbox("Filter by Month:", months, index=m_index,
-                                 format_func=lambda x: pd.to_datetime(x).strftime('%B %Y'), key=f"m_{unique_id}")
+                                 format_func=lambda x: pd.to_datetime(x).strftime('%B %Y') if '-' in x and not str(x).startswith("Current") else x, key=f"m_{unique_id}")
         st.session_state.saved_months[unique_id] = sel_m
 
-    filtered_exps = [e for e in available_exps if any(e.startswith(m) for m in sel_m)] if is_multi else [e for e in
-                                                                                                         available_exps
-                                                                                                         if
-                                                                                                         e.startswith(
-                                                                                                             sel_m)]
+    if not is_multi and sel_m == cw_name:
+        # Hide the second dropdown, return special string
+        special_val = "Current Week|" + "|".join(cw_exps)
+        st.session_state.saved_exps[unique_id] = special_val
+        return special_val
+        
+    filtered_exps = [e for e in available_exps if any(e.startswith(m) for m in sel_m)] if is_multi else [e for e in available_exps if e.startswith(sel_m)]
 
     with col_e:
         saved_e = st.session_state.saved_exps.get(unique_id)
@@ -104,15 +125,40 @@ def render_two_step_selector(unique_id, available_exps, is_multi=True):
             return sel_e
         else:
             e_index = filtered_exps.index(saved_e) if saved_e in filtered_exps else 0
+            if not filtered_exps: return None
             sel_e = st.selectbox("Select Expiration:", filtered_exps, index=e_index, format_func=get_exp_label,
                                  key=f"e_{unique_id}")
             st.session_state.saved_exps[unique_id] = sel_e
             return sel_e
 
+def filter_by_exp(df, sel_exp):
+    if not sel_exp: return df
+    if isinstance(sel_exp, list):
+        return df[df['expiration'].isin(sel_exp)]
+    if str(sel_exp).startswith("Current Week"):
+        dates = str(sel_exp).split("|")[1:]
+        return df[df['expiration'].isin(dates)]
+    return df[df['expiration'] == sel_exp]
 
-# --- DATA CONNECTION & CACHING ---
-@st.cache_data(ttl=3600)
-def load_s3_data():
+import scipy.stats as stats
+import scipy.special as spc
+
+def bs_gamma(S, K, T, r, sigma):
+    T = np.maximum(T, 1/365.0)
+    sigma = np.maximum(sigma, 0.01)
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    gamma = np.exp(-0.5 * d1**2) / (np.sqrt(2 * np.pi) * S * sigma * np.sqrt(T))
+    return gamma
+
+def bs_delta(S, K, T, r, sigma, is_call):
+    T = np.maximum(T, 1/365.0)
+    sigma = np.maximum(sigma, 0.01)
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    cdf_d1 = 0.5 * (1 + spc.erf(d1 / np.sqrt(2)))
+    delta = np.where(is_call, cdf_d1, cdf_d1 - 1.0)
+    return delta
+@st.cache_resource(ttl=3600)
+def init_db_and_summary():
     load_dotenv()
     aws_key = os.getenv('AWS_ACCESS_KEY')
     aws_secret = os.getenv('AWS_SECRET_KEY')
@@ -120,21 +166,23 @@ def load_s3_data():
 
     if not aws_key or not aws_secret:
         st.error("Critical Error: AWS credentials not found. Check your .env file.")
-        return pd.DataFrame(), pd.DataFrame()
+        return None, pd.DataFrame(), ""
 
     con = duckdb.connect(':memory:')
     con.execute("INSTALL httpfs; LOAD httpfs; INSTALL aws; LOAD aws;")
+    con.execute("SET http_keep_alive=false;")
+    con.execute("SET http_timeout=300000;")
+    con.execute("SET http_retries=5;")
+    con.execute("SET http_retry_wait_ms=5000;")
     con.execute(f"CREATE SECRET (TYPE S3, KEY_ID '{aws_key}', SECRET '{aws_secret}', REGION 'us-east-2');")
 
     try:
         df_summary = con.execute(
             f"SELECT * FROM read_parquet('s3://{bucket_name}/dashboard_data/ticker_summary_gold.parquet') WHERE strftime(date, '%Y-%m-%d') NOT IN {tuple(MARKET_HOLIDAYS)} ORDER BY date ASC").df()
-        df_chain = con.execute(
-            f"SELECT * FROM read_parquet('s3://{bucket_name}/dashboard_data/enriched_chain_gold.parquet') WHERE strftime(timestamp, '%Y-%m-%d') NOT IN {tuple(MARKET_HOLIDAYS)} ORDER BY timestamp ASC").df()
-        return df_summary, df_chain
+        return con, df_summary, bucket_name
     except Exception as e:
-        st.error(f"Error connecting to S3: {e}")
-        return pd.DataFrame(), pd.DataFrame()
+        st.error(f"Error connecting to S3 for summary: {e}")
+        return None, pd.DataFrame(), ""
 
 
 @st.cache_data(ttl=86400)
@@ -149,6 +197,24 @@ def fetch_days_to_earnings(ticker):
         return "TBD"
     except:
         return "TBD"
+
+@st.cache_data(ttl=86400)
+def fetch_restricted_earnings_dates(ticker):
+    if ticker.startswith('$') or ticker in ['SPY', 'QQQ', 'IWM', 'DIA', 'VXX']: return set()
+    try:
+        t = yf.Ticker(ticker)
+        df = t.get_earnings_dates(limit=30)
+        if df is not None and not df.empty:
+            dates = pd.to_datetime(df.index).tz_localize(None).normalize()
+            restricted = set()
+            for d in dates:
+                restricted.add(d.strftime('%Y-%m-%d'))
+                restricted.add((d - pd.offsets.BDay(1)).strftime('%Y-%m-%d'))
+                restricted.add((d + pd.offsets.BDay(1)).strftime('%Y-%m-%d'))
+            return restricted
+    except:
+        pass
+    return set()
 
 
 @st.cache_data(ttl=86400)
@@ -169,9 +235,96 @@ def fetch_company_info(ticker):
         return {"name": ticker, "description": "N/A", "market_cap": "N/A", "pe_ratio": "N/A"}
 
 
+
+def render_omni_volatility(ticker_chain_df, ts_20d_df, key_suffix=""):
+    st.subheader("Omni-Volatility Dynamics (Filtered Scope)")
+    c_mode, c_bar, c_exp, c_togg = st.columns([1.5, 1.2, 1, 1])
+    with c_mode:
+        iv_scope = st.radio("Trend Scope:", ["Front-Month (7-45 DTE)", "Specific Expiration"], horizontal=True,
+                            label_visibility="collapsed", key=f"iv_scope_{key_suffix}")
+    with c_bar:
+        bar_mode = st.radio("Background Bars:", ["Volume (Flow)", "Open Interest (Structure)"], horizontal=True,
+                            label_visibility="collapsed", key=f"bar_mode_{key_suffix}")
+    with c_exp:
+        selected_iv_exp = render_two_step_selector("iv_trend_"+key_suffix, sorted(ticker_chain_df['expiration'].dropna().unique()),
+                                                   is_multi=False) if iv_scope == "Specific Expiration" else None
+    with c_togg:
+        show_10_delta = st.checkbox("Show <10Δ Wings", value=True, key=f"show_10_{key_suffix}")
+
+    omni_data, prev_call_oi, prev_put_oi = [], None, None
+    for d in ts_20d_df['date_str'].unique():
+        day_df = ticker_chain_df[ticker_chain_df['date_str'] == d].copy()
+        if day_df.empty or 'underlying_price' not in day_df.columns: continue
+        spot = day_df['underlying_price'].iloc[0]
+        if pd.isna(spot) or spot == 0: continue
+
+        if iv_scope == "Front-Month (7-45 DTE)":
+            valid_df = day_df[(day_df['dte'] >= 7) & (day_df['dte'] <= 45)].copy()
+        elif selected_iv_exp:
+            valid_df = day_df[day_df['expiration'] == selected_iv_exp].copy()
+        else:
+            continue
+
+        if valid_df.empty: continue
+
+        call_vol, put_vol = valid_df[valid_df['side'] == 'CALL']['volume'].sum(), valid_df[valid_df['side'] == 'PUT']['volume'].sum()
+        call_oi, put_oi = valid_df[valid_df['side'] == 'CALL']['open_interest'].sum(), valid_df[valid_df['side'] == 'PUT']['open_interest'].sum()
+        total_vol, total_oi = call_vol + put_vol, call_oi + put_oi
+
+        c_pct = f"{(call_vol / total_vol * 100):.0f}%" if bar_mode == "Volume (Flow)" and total_vol > 0 else (f"{(call_oi / total_oi * 100):.0f}%" if total_oi > 0 else "")
+        p_pct = f"{(put_vol / total_vol * 100):.0f}%" if bar_mode == "Volume (Flow)" and total_vol > 0 else (f"{(put_oi / total_oi * 100):.0f}%" if total_oi > 0 else "")
+
+        c_delta_str = f"ΔOI: {(call_oi - prev_call_oi):+,.0f}" if prev_call_oi is not None and (call_oi - prev_call_oi) != 0 else ""
+        p_delta_str = f"ΔOI: {(put_oi - prev_put_oi):+,.0f}" if prev_put_oi is not None and (put_oi - prev_put_oi) != 0 else ""
+        prev_call_oi, prev_put_oi = call_oi, put_oi
+
+        valid_df['strike_dist'] = (valid_df['strike'] - spot).abs()
+        atm_iv = valid_df[valid_df['strike'] == valid_df.loc[valid_df['strike_dist'].idxmin(), 'strike']]['iv'].mean() if not valid_df['strike_dist'].isna().all() else np.nan
+
+        calls, puts = valid_df[valid_df['side'] == 'CALL'], valid_df[valid_df['side'] == 'PUT']
+        d25_c_iv = calls[(calls['delta'] >= 0.20) & (calls['delta'] <= 0.30)]['iv'].mean()
+        d25_p_iv = puts[(puts['delta'] <= -0.20) & (puts['delta'] >= -0.30)]['iv'].mean()
+        d10_c_iv = calls[(calls['delta'] > 0) & (calls['delta'] <= 0.10)]['iv'].mean()
+        d10_p_iv = puts[(puts['delta'] < 0) & (puts['delta'] >= -0.10)]['iv'].mean()
+        weighted_iv = np.average(valid_df['iv'], weights=valid_df['open_interest']) if valid_df['open_interest'].sum() > 0 else np.nan
+
+        omni_data.append({
+            'date_str': d, 'Call Vol': call_vol, 'Put Vol': put_vol, 'Call OI': call_oi, 'Put OI': put_oi,
+            'Call Pct Text': f"{c_pct}<br>{c_delta_str}".strip("<br>"),
+            'Put Pct Text': f"{p_pct}<br>{p_delta_str}".strip("<br>"),
+            'ATM IV': atm_iv, '25Δ Call': d25_c_iv, '25Δ Put': d25_p_iv, '10Δ Call': d10_c_iv, '10Δ Put': d10_p_iv,
+            'Weighted IV': weighted_iv
+        })
+
+    omni_df = pd.DataFrame(omni_data)
+    if not omni_df.empty:
+        fig_omni = go.Figure()
+        y_call, y_put = ('Call Vol', 'Put Vol') if bar_mode == "Volume (Flow)" else ('Call OI', 'Put OI')
+        y_axis_title = 'Contract Volume' if bar_mode == "Volume (Flow)" else 'Open Interest'
+
+        fig_omni.add_trace(go.Bar(x=omni_df['date_str'], y=omni_df[y_call], name=f'Call {bar_mode.split()[0]}', marker_color='#00CC96', opacity=0.3, yaxis='y1', text=omni_df['Call Pct Text'], textposition='inside'))
+        fig_omni.add_trace(go.Bar(x=omni_df['date_str'], y=omni_df[y_put], name=f'Put {bar_mode.split()[0]}', marker_color='#EF553B', opacity=0.3, yaxis='y1', text=omni_df['Put Pct Text'], textposition='inside'))
+
+        if show_10_delta:
+            fig_omni.add_trace(go.Scatter(x=omni_df['date_str'], y=omni_df['10Δ Call'], name='<10Δ Call IV', mode='lines', line=dict(color='#00FF99', width=1, dash='dashdot'), yaxis='y2', opacity=0.6))
+            fig_omni.add_trace(go.Scatter(x=omni_df['date_str'], y=omni_df['10Δ Put'], name='<10Δ Put IV', mode='lines', line=dict(color='#FF3366', width=1, dash='dashdot'), yaxis='y2', opacity=0.6))
+
+        fig_omni.add_trace(go.Scatter(x=omni_df['date_str'], y=omni_df['25Δ Call'], name='25Δ Call IV', mode='lines', line=dict(color='#00664A', width=2, dash='dot'), yaxis='y2'))
+        fig_omni.add_trace(go.Scatter(x=omni_df['date_str'], y=omni_df['25Δ Put'], name='25Δ Put IV', mode='lines', line=dict(color='#8B2211', width=2, dash='dot'), yaxis='y2'))
+        fig_omni.add_trace(go.Scatter(x=omni_df['date_str'], y=omni_df['ATM IV'], name='ATM IV (Baseline)', mode='lines+markers', line=dict(color='#FFFFFF', width=3), yaxis='y2'))
+        fig_omni.add_trace(go.Scatter(x=omni_df['date_str'], y=omni_df['Weighted IV'], name='OI-Weighted IV', mode='lines+markers', line=dict(color='#FECB52', width=4), yaxis='y2'))
+
+        fig_omni.update_layout(template='plotly_dark', barmode='stack', height=600, hovermode='x unified',
+                               yaxis=dict(title=y_axis_title, side='left', showgrid=False),
+                               yaxis2=dict(title='Implied Volatility (%)', side='right', overlaying='y', showgrid=True),
+                               legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"), margin=dict(b=80))
+        fig_omni.update_xaxes(type='category', categoryorder='category ascending')
+        st.plotly_chart(fig_omni, use_container_width=True)
+
 # --- LOAD DATA ---
-df_summary, df_chain = load_s3_data()
-if df_summary.empty or df_chain.empty: st.stop()
+
+db_con, df_summary, bucket_name = init_db_and_summary()
+if df_summary.empty or db_con is None: st.stop()
 
 # --- GLOBALS & SIDEBAR ---
 st.sidebar.title("Radar Controls")
@@ -182,25 +335,44 @@ global_timeframe = st.sidebar.radio("Global Trend Scope:",
 st.sidebar.divider()
 
 # --- MEGA PRE-COMPUTATION (SPEED FIX) ---
-ticker_summary = df_summary[df_summary['ticker'] == selected_ticker].copy()
-ticker_summary['date_str'] = ticker_summary['date'].astype(str).str[:10]
+@st.cache_data(ttl=3600)
+def process_ticker_data(selected_ticker, _con, bucket_name, _df_summary):
+    t_summary = _df_summary[_df_summary['ticker'] == selected_ticker].copy()
+    t_summary['date_str'] = t_summary['date'].astype(str).str[:10]
 
-ticker_chain = df_chain[df_chain['ticker'] == selected_ticker].copy()
-ticker_chain['date_str'] = ticker_chain['timestamp'].astype(str).str[:10]
-ticker_chain['date_dt'] = pd.to_datetime(ticker_chain['date_str'])
-ticker_chain['exp_dt'] = pd.to_datetime(ticker_chain['expiration'])
-ticker_chain['dte'] = (ticker_chain['exp_dt'] - ticker_chain['date_dt']).dt.days
+    # Predicate Pushdown: Dynamically query ONLY this ticker from the newly partitioned S3 dataset!
+    try:
+        t_chain = _con.execute(
+            f"SELECT * FROM read_parquet('s3://{bucket_name}/dashboard_data/partitioned_chain_gold/ticker={selected_ticker}/*.parquet') "
+            f"WHERE strftime(timestamp, '%Y-%m-%d') NOT IN {tuple(MARKET_HOLIDAYS)} "
+            f"ORDER BY timestamp ASC"
+        ).df()
+    except Exception as e:
+        st.error(f"Error fetching data for {selected_ticker}: {e}")
+        return t_summary, pd.DataFrame()
 
-ticker_chain['underlying_price'] = pd.to_numeric(ticker_chain['underlying_price'], errors='coerce')
-ticker_chain['last_price'] = pd.to_numeric(ticker_chain['last_price'], errors='coerce').fillna(0)
-ticker_chain['volume'] = pd.to_numeric(ticker_chain['volume'], errors='coerce').fillna(0)
-ticker_chain['open_interest'] = pd.to_numeric(ticker_chain['open_interest'], errors='coerce').fillna(0)
-ticker_chain['iv'] = pd.to_numeric(ticker_chain['iv'], errors='coerce')
-ticker_chain['delta'] = pd.to_numeric(ticker_chain['delta'], errors='coerce')
+    if t_chain.empty:
+        return t_summary, t_chain
 
-# Premium tracking
-ticker_chain['premium_vol'] = ticker_chain['volume'] * ticker_chain['last_price'] * 100
-ticker_chain['premium_oi'] = ticker_chain['open_interest'] * ticker_chain['last_price'] * 100
+    t_chain['date_str'] = t_chain['timestamp'].astype(str).str[:10]
+    t_chain['date_dt'] = pd.to_datetime(t_chain['date_str'])
+    t_chain['exp_dt'] = pd.to_datetime(t_chain['expiration'])
+    t_chain['dte'] = (t_chain['exp_dt'] - t_chain['date_dt']).dt.days
+
+    t_chain['underlying_price'] = pd.to_numeric(t_chain['underlying_price'], errors='coerce')
+    t_chain['last_price'] = pd.to_numeric(t_chain['last_price'], errors='coerce').fillna(0)
+    t_chain['volume'] = pd.to_numeric(t_chain['volume'], errors='coerce').fillna(0)
+    t_chain['open_interest'] = pd.to_numeric(t_chain['open_interest'], errors='coerce').fillna(0)
+    t_chain['iv'] = pd.to_numeric(t_chain['iv'], errors='coerce')
+    t_chain['delta'] = pd.to_numeric(t_chain['delta'], errors='coerce')
+    t_chain['gamma'] = pd.to_numeric(t_chain['gamma'], errors='coerce')
+
+    # Premium tracking
+    t_chain['premium_vol'] = t_chain['volume'] * t_chain['last_price'] * 100
+    t_chain['premium_oi'] = t_chain['open_interest'] * t_chain['last_price'] * 100
+    return t_summary, t_chain
+
+ticker_summary, ticker_chain = process_ticker_data(selected_ticker, db_con, bucket_name, df_summary)
 
 available_dates = sorted(ticker_summary['date_str'].unique(), reverse=True)
 selected_date = st.sidebar.selectbox("Select Date Snapshot:", available_dates)
@@ -263,14 +435,16 @@ if row is not None:
 st.divider()
 
 # --- TABS DEFINITION ---
-tab1, tab2, tab3, tab_sector, tab_stealth, tab_signals, tab_heatmap = st.tabs(
-    ["🌊 Positioning", "📈 Volatility", "📍 Gamma/Delta", "⚖️ Sector Rotation", "🕵️ Accumulation", "🎯 Signals", "🌡️ Surface Heatmap"]
+st.sidebar.divider()
+active_tab = st.sidebar.radio(
+    "Select View:",
+    ["🌊 Positioning", "📈 Volatility", "📍 Gamma/Delta", "📉 Short Volume", "🕵️ Accumulation", "🎯 Signals Testing", "⚡ Signals", "🏆 Trade Ideas", "🌡️ Surface Heatmap"]
 )
 
 # ==========================================
 # TAB 1: POSITIONING
 # ==========================================
-with tab1:
+if active_tab == "🌊 Positioning":
     st.subheader(f"Macro Trend Radar ({global_timeframe})")
 
     days_lookback = int(global_timeframe.split()[0])
@@ -294,6 +468,7 @@ with tab1:
     # ==========================================
     col_t1, col_t2 = st.columns(2)
     with col_t1:
+        st.subheader("Volume Stack & P/C Ratio")
         if 'call_volume' not in t_sum.columns:
             t_sum['call_volume'] = t_sum['total_volume'] / (1 + t_sum['put_call_ratio_vol'])
             t_sum['put_volume'] = t_sum['total_volume'] - t_sum['call_volume']
@@ -319,7 +494,7 @@ with tab1:
             go.Scatter(x=vol_agg['plot_date'], y=vol_agg['put_call_ratio_vol'], name='P/C Ratio', mode='lines+markers',
                        line=dict(color='#FECB52', width=2), yaxis='y2'))
 
-        fig_vol.update_layout(title="Volume Stack & P/C Ratio", template='plotly_dark', barmode='stack',
+        fig_vol.update_layout(template='plotly_dark', barmode='stack',
                               yaxis2=dict(title="P/C Ratio", overlaying='y', side='right', range=[0, 2]),
                               legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"),
                               margin=dict(t=50, b=80, l=10, r=10), height=400,
@@ -339,7 +514,7 @@ with tab1:
 
         df_chg = t_chain.copy()
         if oi_chg_dte == "Specific Expiration" and sel_oi_exp:
-            df_chg = df_chg[df_chg['expiration'] == sel_oi_exp]
+            df_chg = filter_by_exp(df_chg, sel_oi_exp)
         elif "Front-Month" in oi_chg_dte:
             df_chg = df_chg[(df_chg['dte'] >= 7) & (df_chg['dte'] <= 45)]
         elif "Long-Term" in oi_chg_dte:
@@ -455,8 +630,8 @@ with tab1:
 
         if sel_hist_exp:
             # Filter the chain for the selected expiration, ending at the selected date, get last 10 days
-            hist_df = ticker_chain[
-                (ticker_chain['expiration'] == sel_hist_exp) & (ticker_chain['date_str'] <= selected_date)].copy()
+            hist_df = ticker_chain[ticker_chain['date_str'] <= selected_date].copy()
+            hist_df = filter_by_exp(hist_df, sel_hist_exp)
 
             if not hist_df.empty:
                 valid_dates = sorted(hist_df['date_str'].unique())[-10:]
@@ -507,7 +682,7 @@ with tab1:
     df_pie = current_chain.copy()
     if not df_pie.empty:
         if pie_scope == "Specific Expiration" and sel_pie_exp:
-            df_pie = df_pie[df_pie['expiration'] == sel_pie_exp]
+            df_pie = filter_by_exp(df_pie, sel_pie_exp)
         elif "Front-Month" in pie_scope:
             df_pie = df_pie[(df_pie['dte'] >= 7) & (df_pie['dte'] <= 45)]
         elif "Long-Term" in pie_scope:
@@ -547,72 +722,39 @@ with tab1:
     # ==========================================
     # ROW 4: VWKS & STRIKE PROFILE
     # ==========================================
-    col_m1, col_m2 = st.columns(2)
-    with col_m1:
-        st.subheader("VWKS Trend (Center of Mass)")
-        c_vw_r, c_vw_s = st.columns([2, 1])
-        with c_vw_r:
-            vwks_scope = st.radio("VWKS Scope:",
-                                  ["All Exps", "Front-Month (7-45 DTE)", "Long-Term (>45 DTE)", "Specific Expiration"],
-                                  horizontal=True, label_visibility="collapsed", key="vwks_radio")
-        with c_vw_s:
-            sel_vwks_exp = render_two_step_selector("vwks_exp", sorted(t_chain['expiration'].dropna().unique()),
-                                                    is_multi=False) if vwks_scope == "Specific Expiration" else None
+    st.subheader("Strike Profile (+/- 20%)")
+    c_sp_mode, c_sp_metric = st.columns(2)
+    with c_sp_mode:
+        sp_scope = st.radio("Profile Scope:", ["Global Scope (DTE)", "Specific Expiration"], horizontal=True,
+                            label_visibility="collapsed")
+    with c_sp_metric:
+        sp_metric = st.radio("Metric:", ["Volume", "Open Interest"], horizontal=True, label_visibility="collapsed")
 
-        if not t_chain.empty:
-            df_vw = t_chain.copy()
-            if vwks_scope == "Specific Expiration" and sel_vwks_exp:
-                df_vw = df_vw[df_vw['expiration'] == sel_vwks_exp]
-            elif "Front-Month" in vwks_scope:
-                df_vw = df_vw[(df_vw['dte'] >= 7) & (df_vw['dte'] <= 45)]
-            elif "Long-Term" in vwks_scope:
-                df_vw = df_vw[df_vw['dte'] > 45]
+    if not current_chain.empty and spot_price > 0:
+        sp_df = current_chain.copy()
+        if sp_scope == "Specific Expiration":
+            avail_exps = sorted(sp_df['expiration'].dropna().unique())
+            selected_sp_exp = render_two_step_selector("sp_profile", avail_exps, is_multi=False)
+            if selected_sp_exp: sp_df = filter_by_exp(sp_df, selected_sp_exp).copy()
+        else:
+            sp_dte = st.radio("DTE Scope (Profile):", ["All Exps", "Front-Month (7-45 DTE)", "Long-Term (>45 DTE)"],
+                              horizontal=True)
+            if "Front-Month" in sp_dte:
+                sp_df = sp_df[(sp_df['dte'] >= 7) & (sp_df['dte'] <= 45)]
+            elif "Long-Term" in sp_dte:
+                sp_df = sp_df[sp_df['dte'] > 45]
 
-            df_vw = df_vw[df_vw['underlying_price'] > 0]
-            if not df_vw.empty:
-                df_vw['vwks_num'] = ((df_vw['strike'] / df_vw['underlying_price']) - 1) * df_vw['volume']
-                vwks_agg = df_vw.groupby('plot_date').agg(num=('vwks_num', 'sum'), den=('volume', 'sum')).reset_index()
-                vwks_agg['vwks'] = (vwks_agg['num'] / vwks_agg['den']) * 100
-                fig_vwks = px.line(vwks_agg, x='plot_date', y='vwks', markers=True, template='plotly_dark')
-                fig_vwks.add_hline(y=0, line_dash="dash", line_color="white", opacity=0.5)
-                fig_vwks.update_layout(xaxis_title=None, yaxis_title="VWKS (%)", margin=dict(t=30, b=10, l=10, r=10),
-                                       xaxis=dict(type='category', categoryorder='category ascending'))
-                st.plotly_chart(fig_vwks, use_container_width=True)
-
-    with col_m2:
-        st.subheader("Strike Profile (+/- 20%)")
-        c_sp_mode, c_sp_metric = st.columns(2)
-        with c_sp_mode:
-            sp_scope = st.radio("Profile Scope:", ["Global Scope (DTE)", "Specific Expiration"], horizontal=True,
-                                label_visibility="collapsed")
-        with c_sp_metric:
-            sp_metric = st.radio("Metric:", ["Volume", "Open Interest"], horizontal=True, label_visibility="collapsed")
-
-        if not current_chain.empty and spot_price > 0:
-            sp_df = current_chain.copy()
-            if sp_scope == "Specific Expiration":
-                avail_exps = sorted(sp_df['expiration'].dropna().unique())
-                selected_sp_exp = render_two_step_selector("sp_profile", avail_exps, is_multi=False)
-                if selected_sp_exp: sp_df = sp_df[sp_df['expiration'] == selected_sp_exp].copy()
-            else:
-                sp_dte = st.radio("DTE Scope (Profile):", ["All Exps", "Front-Month (7-45 DTE)", "Long-Term (>45 DTE)"],
-                                  horizontal=True)
-                if "Front-Month" in sp_dte:
-                    sp_df = sp_df[(sp_df['dte'] >= 7) & (sp_df['dte'] <= 45)]
-                elif "Long-Term" in sp_dte:
-                    sp_df = sp_df[sp_df['dte'] > 45]
-
-            sp_df = sp_df[(sp_df['strike'] >= spot_price * 0.8) & (sp_df['strike'] <= spot_price * 1.2)]
-            if not sp_df.empty:
-                y_col = 'volume' if sp_metric == "Volume" else 'open_interest'
-                sp_agg = sp_df.groupby(['strike', 'side'])[y_col].sum().reset_index()
-                fig_sp = px.bar(sp_agg, x='strike', y=y_col, color='side', barmode='group', template='plotly_dark',
-                                color_discrete_map={'CALL': '#00CC96', 'PUT': '#EF553B'})
-                fig_sp.add_vline(x=spot_price, line_dash="dash", line_color="white", annotation_text="Spot")
-                fig_sp.update_layout(yaxis_title=sp_metric, xaxis_title="Strike Price", hovermode='x unified',
-                                     margin=dict(t=30, b=10, l=10, r=10),
-                                     legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"))
-                st.plotly_chart(fig_sp, use_container_width=True)
+        sp_df = sp_df[(sp_df['strike'] >= spot_price * 0.8) & (sp_df['strike'] <= spot_price * 1.2)]
+        if not sp_df.empty:
+            y_col = 'volume' if sp_metric == "Volume" else 'open_interest'
+            sp_agg = sp_df.groupby(['strike', 'side'])[y_col].sum().reset_index()
+            fig_sp = px.bar(sp_agg, x='strike', y=y_col, color='side', barmode='group', template='plotly_dark',
+                            color_discrete_map={'CALL': '#00CC96', 'PUT': '#EF553B'})
+            fig_sp.add_vline(x=spot_price, line_dash="dash", line_color="white", annotation_text="Spot")
+            fig_sp.update_layout(yaxis_title=sp_metric, xaxis_title="Strike Price", hovermode='x unified',
+                                 margin=dict(t=30, b=10, l=10, r=10),
+                                 legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"))
+            st.plotly_chart(fig_sp, use_container_width=True)
 
     st.divider()
 
@@ -627,113 +769,8 @@ with tab1:
 # ==========================================
 # TAB 2: VOLATILITY
 # ==========================================
-with tab2:
-    st.subheader("Omni-Volatility Dynamics (Filtered Scope)")
-    c_mode, c_bar, c_exp, c_togg = st.columns([1.5, 1.2, 1, 1])
-    with c_mode:
-        iv_scope = st.radio("Trend Scope:", ["Front-Month (7-45 DTE)", "Specific Expiration"], horizontal=True,
-                            label_visibility="collapsed")
-    with c_bar:
-        bar_mode = st.radio("Background Bars:", ["Volume (Flow)", "Open Interest (Structure)"], horizontal=True,
-                            label_visibility="collapsed")
-    with c_exp:
-        selected_iv_exp = render_two_step_selector("iv_trend", sorted(ticker_chain['expiration'].dropna().unique()),
-                                                   is_multi=False) if iv_scope == "Specific Expiration" else None
-    with c_togg:
-        # NEW: Toggle for <10 Delta wings
-        show_10_delta = st.checkbox("Show <10Δ Wings", value=True)
-
-    omni_data, prev_call_oi, prev_put_oi = [], None, None
-    for d in ts_20d['date_str'].unique():
-        day_df = ticker_chain[ticker_chain['date_str'] == d].copy()
-        if day_df.empty or 'underlying_price' not in day_df.columns: continue
-        spot = day_df['underlying_price'].iloc[0]
-        if pd.isna(spot) or spot == 0: continue
-
-        if iv_scope == "Front-Month (7-45 DTE)":
-            valid_df = day_df[(day_df['dte'] >= 7) & (day_df['dte'] <= 45)].copy()
-        elif selected_iv_exp:
-            valid_df = day_df[day_df['expiration'] == selected_iv_exp].copy()
-        else:
-            continue
-
-        if valid_df.empty: continue
-
-        call_vol, put_vol = valid_df[valid_df['side'] == 'CALL']['volume'].sum(), valid_df[valid_df['side'] == 'PUT'][
-            'volume'].sum()
-        call_oi, put_oi = valid_df[valid_df['side'] == 'CALL']['open_interest'].sum(), \
-        valid_df[valid_df['side'] == 'PUT']['open_interest'].sum()
-        total_vol, total_oi = call_vol + put_vol, call_oi + put_oi
-
-        c_pct = f"{(call_vol / total_vol * 100):.0f}%" if bar_mode == "Volume (Flow)" and total_vol > 0 else (
-            f"{(call_oi / total_oi * 100):.0f}%" if total_oi > 0 else "")
-        p_pct = f"{(put_vol / total_vol * 100):.0f}%" if bar_mode == "Volume (Flow)" and total_vol > 0 else (
-            f"{(put_oi / total_oi * 100):.0f}%" if total_oi > 0 else "")
-
-        c_delta_str = f"ΔOI: {(call_oi - prev_call_oi):+,.0f}" if prev_call_oi is not None and (
-                    call_oi - prev_call_oi) != 0 else ""
-        p_delta_str = f"ΔOI: {(put_oi - prev_put_oi):+,.0f}" if prev_put_oi is not None and (
-                    put_oi - prev_put_oi) != 0 else ""
-        prev_call_oi, prev_put_oi = call_oi, put_oi
-
-        valid_df['strike_dist'] = (valid_df['strike'] - spot).abs()
-        atm_iv = valid_df[valid_df['strike'] == valid_df.loc[valid_df['strike_dist'].idxmin(), 'strike']][
-            'iv'].mean() if not valid_df['strike_dist'].isna().all() else np.nan
-
-        calls, puts = valid_df[valid_df['side'] == 'CALL'], valid_df[valid_df['side'] == 'PUT']
-        d25_c_iv = calls[(calls['delta'] >= 0.20) & (calls['delta'] <= 0.30)]['iv'].mean()
-        d25_p_iv = puts[(puts['delta'] <= -0.20) & (puts['delta'] >= -0.30)]['iv'].mean()
-        d10_c_iv = calls[(calls['delta'] > 0) & (calls['delta'] <= 0.10)]['iv'].mean()
-        d10_p_iv = puts[(puts['delta'] < 0) & (puts['delta'] >= -0.10)]['iv'].mean()
-        weighted_iv = np.average(valid_df['iv'], weights=valid_df['open_interest']) if valid_df[
-                                                                                           'open_interest'].sum() > 0 else np.nan
-
-        omni_data.append({
-            'date_str': d, 'Call Vol': call_vol, 'Put Vol': put_vol, 'Call OI': call_oi, 'Put OI': put_oi,
-            'Call Pct Text': f"{c_pct}<br>{c_delta_str}".strip("<br>"),
-            'Put Pct Text': f"{p_pct}<br>{p_delta_str}".strip("<br>"),
-            'ATM IV': atm_iv, '25Δ Call': d25_c_iv, '25Δ Put': d25_p_iv, '10Δ Call': d10_c_iv, '10Δ Put': d10_p_iv,
-            'Weighted IV': weighted_iv
-        })
-
-    omni_df = pd.DataFrame(omni_data)
-    if not omni_df.empty:
-        fig_omni = go.Figure()
-        y_call, y_put = ('Call Vol', 'Put Vol') if bar_mode == "Volume (Flow)" else ('Call OI', 'Put OI')
-        y_axis_title = 'Contract Volume' if bar_mode == "Volume (Flow)" else 'Open Interest'
-
-        fig_omni.add_trace(
-            go.Bar(x=omni_df['date_str'], y=omni_df[y_call], name=f'Call {bar_mode.split()[0]}', marker_color='#00CC96',
-                   opacity=0.3, yaxis='y1', text=omni_df['Call Pct Text'], textposition='inside'))
-        fig_omni.add_trace(
-            go.Bar(x=omni_df['date_str'], y=omni_df[y_put], name=f'Put {bar_mode.split()[0]}', marker_color='#EF553B',
-                   opacity=0.3, yaxis='y1', text=omni_df['Put Pct Text'], textposition='inside'))
-
-        # Apply Toggle for 10 Delta
-        if show_10_delta:
-            fig_omni.add_trace(
-                go.Scatter(x=omni_df['date_str'], y=omni_df['10Δ Call'], name='<10Δ Call IV', mode='lines',
-                           line=dict(color='#00FF99', width=1, dash='dashdot'), yaxis='y2', opacity=0.6))
-            fig_omni.add_trace(go.Scatter(x=omni_df['date_str'], y=omni_df['10Δ Put'], name='<10Δ Put IV', mode='lines',
-                                          line=dict(color='#FF3366', width=1, dash='dashdot'), yaxis='y2', opacity=0.6))
-
-        fig_omni.add_trace(go.Scatter(x=omni_df['date_str'], y=omni_df['25Δ Call'], name='25Δ Call IV', mode='lines',
-                                      line=dict(color='#00664A', width=2, dash='dot'), yaxis='y2'))
-        fig_omni.add_trace(go.Scatter(x=omni_df['date_str'], y=omni_df['25Δ Put'], name='25Δ Put IV', mode='lines',
-                                      line=dict(color='#8B2211', width=2, dash='dot'), yaxis='y2'))
-        fig_omni.add_trace(
-            go.Scatter(x=omni_df['date_str'], y=omni_df['ATM IV'], name='ATM IV (Baseline)', mode='lines+markers',
-                       line=dict(color='#FFFFFF', width=3), yaxis='y2'))
-        fig_omni.add_trace(
-            go.Scatter(x=omni_df['date_str'], y=omni_df['Weighted IV'], name='OI-Weighted IV', mode='lines+markers',
-                       line=dict(color='#FECB52', width=4), yaxis='y2'))
-
-        fig_omni.update_layout(template='plotly_dark', barmode='stack', height=600, hovermode='x unified',
-                               yaxis=dict(title=y_axis_title, side='left', showgrid=False),
-                               yaxis2=dict(title='Implied Volatility (%)', side='right', overlaying='y', showgrid=True),
-                               legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"), margin=dict(b=80))
-        fig_omni.update_xaxes(type='category', categoryorder='category ascending')
-        st.plotly_chart(fig_omni, use_container_width=True)
+if active_tab == "📈 Volatility":
+    render_omni_volatility(ticker_chain, ts_20d, key_suffix="tab2")
 
     st.divider()
 
@@ -957,7 +994,7 @@ with tab2:
 # ==========================================
 # TAB 3: GAMMA & DELTA (Exposure Profiles)
 # ==========================================
-with tab3:
+if active_tab == "📍 Gamma/Delta":
     st.subheader("Gamma Exposure Profile (GEX)")
     c_g_model, c_g_view, c_g_dte, c_g_sel = st.columns([1.2, 1, 1.5, 1])
     with c_g_model:
@@ -976,7 +1013,7 @@ with tab3:
 
     chain_gex = current_chain.copy()
     if gamma_dte == "Specific Expiration" and sel_gamma_exp:
-        chain_gex = chain_gex[chain_gex['expiration'] == sel_gamma_exp]
+        chain_gex = filter_by_exp(chain_gex, sel_gamma_exp)
     elif "Front-Month" in gamma_dte:
         chain_gex = chain_gex[(chain_gex['dte'] >= 7) & (chain_gex['dte'] <= 45)]
     elif "Long-Term" in gamma_dte:
@@ -1055,7 +1092,7 @@ with tab3:
 
     chain_dex = current_chain.copy()
     if delta_dte == "Specific Expiration" and sel_delta_exp:
-        chain_dex = chain_dex[chain_dex['expiration'] == sel_delta_exp]
+        chain_dex = filter_by_exp(chain_dex, sel_delta_exp)
     elif "Front-Month" in delta_dte:
         chain_dex = chain_dex[(chain_dex['dte'] >= 7) & (chain_dex['dte'] <= 45)]
     elif "Long-Term" in delta_dte:
@@ -1088,344 +1125,91 @@ with tab3:
         st.plotly_chart(fig_d, use_container_width=True)
 
 
-# ==========================================
-# CACHED SECTOR ROTATION ENGINE
-# ==========================================
-@st.cache_data(ttl=3600)
-def compute_rotation_scores(df, comp_date):
-    """Compute composite rotation scores for all 16 sector ETFs."""
-    tickers = list(SECTOR_MAP.keys())
-    sec = df[df['ticker'].isin(tickers)].copy()
-    if sec.empty: return pd.DataFrame()
 
-    sec['timestamp_dt'] = pd.to_datetime(sec['timestamp'])
-    sec = sec[sec['timestamp_dt'].dt.weekday < 5].copy()
-    sec['date_str'] = sec['timestamp_dt'].dt.strftime('%Y-%m-%d')
-    sec['date_dt'] = pd.to_datetime(sec['date_str'])
-    sec['exp_dt'] = pd.to_datetime(sec['expiration'])
-    sec['dte'] = (sec['exp_dt'] - sec['date_dt']).dt.days
-    sec['underlying_price'] = pd.to_numeric(sec['underlying_price'], errors='coerce')
-    sec['volume'] = pd.to_numeric(sec['volume'], errors='coerce').fillna(0)
-    sec['last_price'] = pd.to_numeric(sec['last_price'], errors='coerce').fillna(0)
-    sec['iv'] = pd.to_numeric(sec['iv'], errors='coerce')
-    sec['delta'] = pd.to_numeric(sec['delta'], errors='coerce')
-    sec['premium'] = sec['volume'] * sec['last_price'] * 100
-
-    # Get SPY prices from yfinance (single ticker, fast)
-    try:
-        spy_data = yf.download('SPY', start='2026-01-01', end=comp_date, progress=False)
-        spy = spy_data[('Close', 'SPY')].dropna() if not spy_data.empty else pd.Series()
-    except:
-        spy = pd.Series()
-    if spy.empty: return pd.DataFrame()
-
-    # Use S3 chain underlying_price for sector ETFs (no network call needed)
-    prices = {}
-    for t in tickers:
-        t_px = df[(df['ticker'] == t) & (df['timestamp'] < comp_date)].drop_duplicates(subset=['timestamp'])
-        if not t_px.empty:
-            t_px = t_px.sort_values('timestamp')
-            t_px['date_dt'] = pd.to_datetime(t_px['timestamp']).dt.date
-            prices[t] = t_px.set_index('date_dt')['underlying_price'].dropna()
-    prices['SPY'] = spy
-
-    # Front-month chain
-    fm = sec[sec['dte'].between(7, 45)]
-    if fm.empty: return pd.DataFrame()
-
-    # Daily skew per ticker
-    calls_25 = fm[(fm['side'] == 'CALL') & (fm['delta'].between(0.2, 0.3))].groupby(['ticker', 'date_str'])['iv'].mean()
-    puts_25 = fm[(fm['side'] == 'PUT') & (fm['delta'].between(-0.3, -0.2))].groupby(['ticker', 'date_str'])['iv'].mean()
-    skew_raw = ((puts_25 - calls_25) * 100).dropna().reset_index()
-    skew_raw.columns = ['ticker', 'date_str', 'skew']
-
-    # Daily premium per ticker
-    prem_call = fm[fm['side'] == 'CALL'].groupby(['ticker', 'date_str'])['premium'].sum()
-    prem_put = fm[fm['side'] == 'PUT'].groupby(['ticker', 'date_str'])['premium'].sum()
-    prem_net = (prem_call - prem_put).dropna().reset_index()
-    prem_net.columns = ['ticker', 'date_str', 'net_prem']
-
-    # Aggregate to latest date for each ticker + compute across available history for each
-    rows = []
-    latest_dates = sec['date_str'].unique()
-    # Use last 60 trading days
-    lookback_dates = sorted(latest_dates)[-60:] if len(latest_dates) >= 60 else sorted(latest_dates)
-
-    for t in tickers:
-        if t not in prices or spy.empty: continue
-        px = prices[t]
-        common = px.index.intersection(spy.index)
-        if len(common) < 20: continue
-        px_a = px[common]; spy_a = spy[common]
-
-        # Price RS (10d and 20d)
-        rel_10d = ((px_a/px_a.shift(10)-1) - (spy_a/spy_a.shift(10)-1)).dropna()
-        rel_20d = ((px_a/px_a.shift(20)-1) - (spy_a/spy_a.shift(20)-1)).dropna()
-        rs_momentum = (rel_10d - rel_10d.shift(5)).dropna()
-
-        latest_rel_10d = rel_10d.iloc[-1] * 100 if len(rel_10d) > 0 else 0
-        latest_rel_20d = rel_20d.iloc[-1] * 100 if len(rel_20d) > 0 else 0
-        latest_rs_mom = rs_momentum.iloc[-1] * 100 if len(rs_momentum) > 0 else 0
-
-        # Options metrics for this ticker
-        t_skew = skew_raw[skew_raw['ticker'] == t].sort_values('date_str')
-        t_prem = prem_net[prem_net['ticker'] == t].sort_values('date_str')
-
-        if t_skew.empty: continue
-
-        skew_latest = t_skew['skew'].iloc[-1]
-        skew_vals = t_skew['skew'].dropna()
-        skew_pct = (skew_vals.iloc[-20:] < skew_latest).mean() * 100 if len(skew_vals) >= 20 else 50
-        skew_momentum = skew_vals.iloc[-1] - skew_vals.iloc[-6] if len(skew_vals) >= 6 else 0
-
-        # Premium flow
-        prem_vals = t_prem['net_prem'].dropna()
-        prem_5d = prem_vals.iloc[-5:].sum() if len(prem_vals) >= 5 else prem_vals.sum()
-        prem_10d = prem_vals.iloc[-10:].sum() if len(prem_vals) >= 10 else prem_vals.sum()
-
-        # Historical scores for timeline (last N periods)
-        hist_scores = []
-        for idx in range(max(0, len(t_skew)-30), len(t_skew)):
-            d = t_skew['date_str'].iloc[idx]
-            if d not in common: continue
-            d_idx = common.get_loc(d) if d in common else -1
-            if d_idx < 10: continue
-            h_rel_10 = ((px_a.iloc[d_idx]/px_a.iloc[d_idx-10]-1) - (spy_a.iloc[d_idx]/spy_a.iloc[d_idx-10]-1)) * 100 if d_idx >= 10 else 0
-            h_skew = t_skew['skew'].iloc[idx]
-            h_prem = t_prem[t_prem['date_str'] <= d]['net_prem'].iloc[-10:].sum() if len(t_prem[t_prem['date_str'] <= d]) >= 10 else 0
-            hist_scores.append({'date_str': d, 'ticker': t, 'rel_10d': h_rel_10, 'skew': h_skew, 'prem_10d': h_prem})
-
-        rows.append({
-            'ticker': t, 'name': SECTOR_MAP.get(t, t),
-            'rel_10d': latest_rel_10d, 'rel_20d': latest_rel_20d, 'rs_momentum': latest_rs_mom,
-            'skew_latest': skew_latest, 'skew_pct': skew_pct, 'skew_momentum': skew_momentum,
-            'prem_5d': prem_5d, 'prem_10d': prem_10d, 'hist_scores': hist_scores
-        })
-
-    if len(rows) < 3: return pd.DataFrame()
-
-    comp = pd.DataFrame(rows)
-
-    # Z-score normalize across sectors
-    for col in ['rel_10d', 'rs_momentum', 'prem_10d', 'skew_latest']:
-        if col in comp.columns:
-            v = comp[col].dropna()
-            if len(v) > 1 and v.std() > 0:
-                comp[f'{col}_z'] = ((comp[col] - v.mean()) / v.std()).clip(-2, 2) / 2
-
-    # Composite: 30% RS + 25% skew + 30% flow + 15% momentum
-    comp['score'] = 0.0
-    w_sum = 0.0
-    for col, w in [('rel_10d_z', 0.30), ('skew_latest_z', 0.25), ('prem_10d_z', 0.30), ('rs_momentum_z', 0.15)]:
-        if col in comp.columns:
-            comp['score'] += comp[col].fillna(0) * w
-            w_sum += w
-    if w_sum > 0: comp['score'] = (comp['score'] / w_sum) * 100
-
-    # Zone classification
-    def zone_label(s):
-        if s > 60: return 'Extreme Overbought'
-        if s > 20: return 'Overbought'
-        if s > -20: return 'Neutral'
-        if s > -60: return 'Oversold'
-        return 'Deep Oversold'
-    comp['zone'] = comp['score'].apply(zone_label)
-
-    # Divergence detection
-    comp['divergence'] = ''
-    for i, r in comp.iterrows():
-        rs_z = r.get('rel_10d_z', 0) or 0
-        sk_z = r.get('skew_latest_z', 0) or 0
-        if rs_z > 0.3 and sk_z < -0.2:
-            comp.at[i, 'divergence'] = 'Bearish Div (Price up, Options fearful)'
-        elif rs_z < -0.3 and sk_z > 0.2:
-            comp.at[i, 'divergence'] = 'Bullish Div (Price down, Options greedy)'
-
-    return comp.sort_values('score', ascending=False)
-
-
-# ==========================================
-# TAB 4: SECTOR ROTATION OSCILLATOR
-# ==========================================
-with tab_sector:
-    st.header("Sector Rotation Oscillator")
-    st.markdown("Composite score from price relative strength (30%), options skew (25%), premium flow (30%), and RS momentum (15%). **Overbought = rotation OUT likely. Oversold = rotation IN likely.**")
-
-    with st.spinner("Computing rotation scores..."):
-        rotation_df = compute_rotation_scores(df_chain, comp_date)
-
-    if rotation_df.empty:
-        st.warning("Insufficient data to compute rotation scores.")
-    else:
-        # ═══════════ ROW 1: ROTATION OSCILLATOR (HORIZONTAL BARS) ═══════════
-        st.divider()
-        c_osc, c_legend = st.columns([3, 1])
-        with c_osc:
-            st.subheader("Rotation Score — All 16 Sectors")
-
-            fig_osc = go.Figure()
-
-            # Color map by zone
-            zone_colors = {
-                'Extreme Overbought': '#00CC96',
-                'Overbought': 'rgba(0,204,150,0.6)',
-                'Neutral': 'rgba(254,203,82,0.5)',
-                'Oversold': 'rgba(239,85,59,0.6)',
-                'Deep Oversold': '#EF553B'
-            }
-
-            display_df = rotation_df.copy()
-            colors = [zone_colors.get(z, '#888') for z in display_df['zone']]
-
-            fig_osc.add_trace(go.Bar(
-                y=display_df['name'], x=display_df['score'],
-                orientation='h', marker_color=colors,
-                text=[f"{s:+.0f}  " for s in display_df['score']],
-                textposition='outside', textfont=dict(color='white', size=11),
-                hovertemplate='%{y}: %{x:+.0f}<br>Zone: %{customdata}<br>RS 10d: %{text}%',
-                customdata=display_df['zone'],
-            ))
-
-            # Zone lines
-            for val, color, label in [(-60, 'rgba(239,85,59,0.4)', 'Deep Oversold'),
-                                       (-20, 'rgba(239,85,59,0.25)', 'Oversold'),
-                                       (20, 'rgba(0,204,150,0.25)', 'Overbought'),
-                                       (60, 'rgba(0,204,150,0.4)', 'Extreme Overbought')]:
-                fig_osc.add_vline(x=val, line_dash='dash', line_color=color, line_width=1,
-                                  annotation_text=label if abs(val)==60 else None,
-                                  annotation_position='top' if val > 0 else 'bottom')
-            fig_osc.add_vline(x=0, line_color='white', line_width=1, opacity=0.4)
-
-            # Divergence markers
-            divs = display_df[display_df['divergence'] != '']
-            for _, d in divs.iterrows():
-                idx = list(display_df['name']).index(d['name'])
-                symb = '⚠️' if 'Bearish' in d['divergence'] else '💡'
-                fig_osc.add_annotation(y=d['name'], x=d['score'] + (8 if d['score'] >= 0 else -8),
-                    text=symb, showarrow=False, font=dict(size=14))
-
-            fig_osc.update_layout(
-                template='plotly_dark', height=500, margin=dict(l=10, r=60, t=10, b=10),
-                xaxis=dict(title='Rotation Score (-100 to +100)', range=[-100, 100], showgrid=True, gridcolor='rgba(255,255,255,0.08)'),
-                yaxis=dict(autorange='reversed', showgrid=False),
-                showlegend=False, hovermode='y unified'
-            )
-            st.plotly_chart(fig_osc, use_container_width=True)
-
-        with c_legend:
-            st.markdown("**Zone Key**")
-            st.markdown("🟢 **+60 to +100** Extreme Overbought — Rotation OUT")
-            st.markdown("🟢 **+20 to +60** Overbought")
-            st.markdown("🟡 **-20 to +20** Neutral — No signal")
-            st.markdown("🔴 **-60 to -20** Oversold")
-            st.markdown("🔴 **-100 to -60** Deep Oversold — Rotation IN")
-            st.divider()
-            st.markdown("**Divergence Markers**")
-            st.markdown("⚠️ = Bearish Divergence (price up but options fearful)")
-            st.markdown("💡 = Bullish Divergence (price down but options greedy)")
-            st.divider()
-            # Top/bottom summary
-            top3 = rotation_df.head(3)
-            bot3 = rotation_df.tail(3)
-            st.metric("Most Overbought", top3['name'].iloc[0], f"{top3['score'].iloc[0]:+.0f}")
-            if len(top3) > 1:
-                st.caption(f"2. {top3['name'].iloc[1]} ({top3['score'].iloc[1]:+.0f})")
-                st.caption(f"3. {top3['name'].iloc[2]} ({top3['score'].iloc[2]:+.0f})")
-            st.divider()
-            st.metric("Most Oversold", bot3['name'].iloc[-1], f"{bot3['score'].iloc[-1]:+.0f}")
-            if len(bot3) > 1:
-                st.caption(f"2. {bot3['name'].iloc[-2]} ({bot3['score'].iloc[-2]:+.0f})")
-                st.caption(f"3. {bot3['name'].iloc[-3]} ({bot3['score'].iloc[-3]:+.0f})")
-
-        # ═══════════ ROW 2: FLOW vs SKEW MATRIX (SCATTER) ═══════════
-        st.divider()
-        st.subheader("Flow vs Skew — Divergence Matrix")
-        c_scat, c_scat_desc = st.columns([2.5, 1])
-
-        with c_scat:
-            fig_mat = go.Figure()
-
-            for _, r in rotation_df.iterrows():
-                sz = max(15, min(40, abs(r['prem_10d']) / max(1, abs(rotation_df['prem_10d']).mean()) * 20))
-                color = zone_colors.get(r['zone'], '#888')
-
-                fig_mat.add_trace(go.Scatter(
-                    x=[r['skew_latest']], y=[r['rel_10d']],
-                    mode='markers+text', name=r['name'],
-                    marker=dict(size=sz, color=color, line=dict(color='white', width=1)),
-                    text=r['ticker'], textposition='top center', textfont=dict(size=9, color='white'),
-                    hovertemplate=f"{r['name']}<br>Skew: {r['skew_latest']:+.1f}<br>RS 10d: {r['rel_10d']:+.1f}%<br>Score: {r['score']:+.0f}"
-                ))
-
-            fig_mat.add_hline(y=0, line_color='white', line_width=1, opacity=0.3)
-            fig_mat.add_vline(x=0, line_color='white', line_width=1, opacity=0.3)
-
-            # Quadrant labels
-            fig_mat.add_annotation(x=15, y=4, text='Bullish Flow<br>+ Price Leading', showarrow=False,
-                font=dict(size=9, color='rgba(0,204,150,0.5)'))
-            fig_mat.add_annotation(x=-15, y=4, text='Fear Premium<br>+ Price Leading', showarrow=False,
-                font=dict(size=9, color='rgba(254,203,82,0.5)'))
-            fig_mat.add_annotation(x=15, y=-4, text='Bullish Flow<br>+ Price Lagging', showarrow=False,
-                font=dict(size=9, color='rgba(254,203,82,0.5)'))
-            fig_mat.add_annotation(x=-15, y=-4, text='Fear Premium<br>+ Price Lagging', showarrow=False,
-                font=dict(size=9, color='rgba(239,85,59,0.5)'))
-
-            fig_mat.update_layout(
-                template='plotly_dark', height=450, margin=dict(l=10, r=10, t=10, b=10),
-                xaxis=dict(title='Put-Call Skew (positive = fear, negative = greed)', showgrid=True, gridcolor='rgba(255,255,255,0.06)'),
-                yaxis=dict(title='10-Day Relative Strength vs SPY (%)', showgrid=True, gridcolor='rgba(255,255,255,0.06)'),
-                showlegend=False, hovermode='closest'
-            )
-            st.plotly_chart(fig_mat, use_container_width=True)
-
-        with c_scat_desc:
-            st.info("**How to read this chart:**\n\n"
-                "**X-axis (Skew):** Right = puts expensive (fear). Left = calls expensive (greed).\n\n"
-                "**Y-axis (RS):** Up = outperforming SPY. Down = underperforming.\n\n"
-                "**Bubble size** = premium flow magnitude.\n\n"
-                "**Top-right = Strong & Loved** — momentum, but watch for exhaustion.\n"
-                "**Bottom-left = Weak & Hated** — potential value if skew shows fear capitulation.\n"
-                "**Top-left = Fear Premium + Price Leading** — divergence, institutions hedging a rally.\n"
-                "**Bottom-right = Bullish Flow + Price Lagging** — divergence, smart money buying the dip.")
-
-        # ═══════════ ROW 3: DIVERGENCE ALERTS ═══════════
-        if len(divs) > 0:
-            st.divider()
-            st.subheader("Active Divergence Alerts")
-            alert_cols = st.columns(min(len(divs), 4))
-            for i, (_, d) in enumerate(divs.iterrows()):
-                with alert_cols[i % 4]:
-                    is_bear = 'Bearish' in d['divergence']
-                    st.warning(f"**{d['name']} ({d['ticker']})**\n\n"
-                        f"{d['divergence']}\n\n"
-                        f"Score: {d['score']:+.0f} | RS 10d: {d['rel_10d']:+.1f}% | Skew: {d['skew_latest']:+.1f}")
-
-        # ═══════════ ROW 4: SCORE BREAKDOWN TABLE ═══════════
-        st.divider()
-        st.subheader("Score Breakdown")
-        breakdown = rotation_df[['ticker', 'name', 'score', 'zone', 'rel_10d', 'skew_latest', 'skew_pct', 'prem_10d', 'divergence']].copy()
-        breakdown.columns = ['ETF', 'Sector', 'Score', 'Zone', 'RS 10d %', 'Skew', 'Skew %ile', 'Flow 10d $', 'Divergence']
-        breakdown['Score'] = breakdown['Score'].apply(lambda x: f"{x:+.0f}")
-        breakdown['RS 10d %'] = breakdown['RS 10d %'].apply(lambda x: f"{x:+.1f}")
-        breakdown['Skew'] = breakdown['Skew'].apply(lambda x: f"{x:+.1f}")
-        breakdown['Skew %ile'] = breakdown['Skew %ile'].apply(lambda x: f"{x:.0f}")
-        breakdown['Flow 10d $'] = breakdown['Flow 10d $'].apply(lambda x: f"${x/1e6:+.1f}M" if abs(x) > 1e6 else f"${x/1e3:+.0f}K")
-
-        def highlight_divergence(val):
-            if 'Bearish' in str(val): return 'background-color: rgba(239,85,59,0.3); color: #EF553B'
-            if 'Bullish' in str(val): return 'background-color: rgba(0,204,150,0.3); color: #00CC96'
-            return ''
-
-        try:
-            styled = breakdown.style.applymap(highlight_divergence, subset=['Divergence'])
-        except AttributeError:
-            styled = breakdown.style.map(highlight_divergence, subset=['Divergence'])
-        st.dataframe(styled, use_container_width=True, hide_index=True)
+    # ==========================================
+    # DEALER GAMMA & DELTA PROFILES
+    # ==========================================
+    st.divider()
+    st.subheader("Dealer Implied Gamma Profile")
+    st.markdown("Displays the net dealer gamma assuming dealers are short both calls and puts (Calls +, Puts -).")
+    
+    prof_chain = current_chain.copy()
+    if delta_dte == "Specific Expiration" and sel_delta_exp:
+        prof_chain = filter_by_exp(prof_chain, sel_delta_exp)
+    elif "Front-Month" in delta_dte:
+        prof_chain = prof_chain[(prof_chain['dte'] >= 7) & (prof_chain['dte'] <= 45)]
+    elif "Long-Term" in delta_dte:
+        prof_chain = prof_chain[prof_chain['dte'] > 45]
+        
+    if not prof_chain.empty and spot_price > 0:
+        spot_range = np.linspace(spot_price * 0.85, spot_price * 1.15, 60)
+        S = spot_range
+        K = prof_chain['strike'].to_numpy(dtype=float)[:, np.newaxis]
+        T = prof_chain['dte'].to_numpy(dtype=float)[:, np.newaxis] / 365.0
+        sigma = prof_chain['iv'].to_numpy(dtype=float)[:, np.newaxis]
+        is_call = (prof_chain['side'] == 'CALL').to_numpy(dtype=bool)[:, np.newaxis]
+        oi = prof_chain['open_interest'].to_numpy(dtype=float)[:, np.newaxis]
+        
+        gamma_mat = bs_gamma(S[np.newaxis, :], K, T, 0.05, sigma)
+        sign_mat = np.where(is_call, 1, -1)
+        gex_mat = sign_mat * gamma_mat * oi * 100 * (S[np.newaxis, :]**2) * 0.01
+        net_gex_curve = np.sum(gex_mat, axis=0)
+        
+        flip_point = None
+        for i in range(len(net_gex_curve)-1):
+            if net_gex_curve[i] * net_gex_curve[i+1] <= 0:
+                m = (net_gex_curve[i+1] - net_gex_curve[i]) / (S[i+1] - S[i])
+                if m != 0:
+                    flip_point = S[i] - net_gex_curve[i] / m
+                break
+                
+        fig_prof = go.Figure()
+        fig_prof.add_trace(go.Scatter(x=S, y=net_gex_curve, mode='lines', fill='tozeroy', 
+            fillcolor='rgba(0, 204, 150, 0.2)', line=dict(color='#00CC96', width=3), name='Net Dealer Gamma'))
+        
+        fig_prof.add_vline(x=spot_price, line_dash="dash", line_color="white", annotation_text=f"Spot: {spot_price:.2f}")
+        if flip_point:
+            fig_prof.add_vline(x=flip_point, line_dash="dot", line_color="#FECB52", annotation_text=f"Flip: {flip_point:.2f}")
+            
+        fig_prof.update_layout(template='plotly_dark', title="Dealer Gamma Profile ($ per 1% Spot Move)",
+                               xaxis_title="Simulated Spot Price", yaxis_title="Net Dealer GEX ($)")
+        st.plotly_chart(fig_prof, use_container_width=True)
+        
+    st.divider()
+    st.subheader("Dealer Implied Delta Profile")
+    st.markdown("Displays the net structural delta across simulated spot prices.")
+    
+    if not prof_chain.empty and spot_price > 0:
+        delta_mat = bs_delta(S[np.newaxis, :], K, T, 0.05, sigma, is_call)
+        
+        # Net Delta is Call Delta + Put Delta (put delta is already negative)
+        dex_mat = delta_mat * oi * 100 * S[np.newaxis, :]
+        net_dex_curve = np.sum(dex_mat, axis=0)
+        
+        flip_dex = None
+        for i in range(len(net_dex_curve)-1):
+            if net_dex_curve[i] * net_dex_curve[i+1] <= 0:
+                m = (net_dex_curve[i+1] - net_dex_curve[i]) / (S[i+1] - S[i])
+                if m != 0:
+                    flip_dex = S[i] - net_dex_curve[i] / m
+                break
+                
+        fig_dex = go.Figure()
+        fig_dex.add_trace(go.Scatter(x=S, y=net_dex_curve, mode='lines', fill='tozeroy', 
+            fillcolor='rgba(239, 85, 59, 0.2)', line=dict(color='#EF553B', width=3), name='Net Dealer Delta'))
+            
+        fig_dex.add_vline(x=spot_price, line_dash="dash", line_color="white", annotation_text=f"Spot: {spot_price:.2f}")
+        if flip_dex:
+            fig_dex.add_vline(x=flip_dex, line_dash="dot", line_color="#FECB52", annotation_text=f"Zero Delta: {flip_dex:.2f}")
+            
+        fig_dex.update_layout(template='plotly_dark', title="Dealer Delta Profile (Notional DEX $)",
+                               xaxis_title="Simulated Spot Price", yaxis_title="Net Dealer DEX ($)")
+        st.plotly_chart(fig_dex, use_container_width=True)
 
 # ==========================================
 # TAB 7: STEALTH ACCUMULATION VISUALIZER
 # ==========================================
-with tab_stealth:
+if active_tab == "🕵️ Accumulation":
     st.header("🕵️ Stealth Accumulation Radar")
     st.markdown("Visualizing leading indicators of institutional positioning before underlying price breakouts.")
 
@@ -1706,9 +1490,15 @@ with tab_stealth:
                         "**Why it's useful:** Spotlights short-term premium inflation anomalies that reflect sudden, aggressive localized capital execution.")
 
 # ==========================================
+# TAB 5: SIGNALS TESTING
+# ==========================================
+if active_tab == "🎯 Signals Testing":
+    st.header("5D MA Trend & Option Flow Gap Divergence (Signals Testing)")
+
+# ==========================================
 # TAB 7.5: BACKTESTED SIGNALS — FILTERED & RISK-MANAGED
 # ==========================================
-with tab_signals:
+if active_tab == "🎯 Signals Testing":
     st.header("🎯 Backtested Signal Fire Monitor")
     st.markdown("Real-time signal detection using V2 backtest methodology — M3_p90_w90, Put VWKS, Backwardation magnitude, and OTM Delta. **Q1-filtered with -2% stop loss for tradeable quality.**")
 
@@ -2005,11 +1795,11 @@ with tab_signals:
                 gap_hl['put_gap_3d'] = (gap_hl['spot'] - gap_hl['VWKS_PUT_3D']) / gap_hl['spot'] * 100
                 gap_hl['call_gap_5d'] = (gap_hl['spot'] - gap_hl['VWKS_5D_MA']) / gap_hl['spot'] * 100
                 gap_hl['put_gap_5d'] = (gap_hl['spot'] - gap_hl['VWKS_PUT_5D']) / gap_hl['spot'] * 100
-                # Highlight: within 2% OR crossed over (call: spot>call VWKS, put: spot<put VWKS)
-                gap_hl['call_hl_3d'] = (gap_hl['call_gap_3d'].abs() < 2) | (gap_hl['spot'] > gap_hl['VWKS_3D_MA'])
-                gap_hl['put_hl_3d'] = (gap_hl['put_gap_3d'].abs() < 2) | (gap_hl['spot'] < gap_hl['VWKS_PUT_3D'])
-                gap_hl['call_hl_5d'] = (gap_hl['call_gap_5d'].abs() < 2) | (gap_hl['spot'] > gap_hl['VWKS_5D_MA'])
-                gap_hl['put_hl_5d'] = (gap_hl['put_gap_5d'].abs() < 2) | (gap_hl['spot'] < gap_hl['VWKS_PUT_5D'])
+                # Highlight: within 1% OR crossed over (call: spot>call VWKS, put: spot<put VWKS)
+                gap_hl['call_hl_3d'] = (gap_hl['call_gap_3d'].abs() < 1) | (gap_hl['spot'] > gap_hl['VWKS_3D_MA'])
+                gap_hl['put_hl_3d'] = (gap_hl['put_gap_3d'].abs() < 1) | (gap_hl['spot'] < gap_hl['VWKS_PUT_3D'])
+                gap_hl['call_hl_5d'] = (gap_hl['call_gap_5d'].abs() < 1) | (gap_hl['spot'] > gap_hl['VWKS_5D_MA'])
+                gap_hl['put_hl_5d'] = (gap_hl['put_gap_5d'].abs() < 1) | (gap_hl['spot'] < gap_hl['VWKS_PUT_5D'])
                 gap_hl['any_hl_3d'] = gap_hl['call_hl_3d'] | gap_hl['put_hl_3d']
                 gap_hl['any_hl_5d'] = gap_hl['call_hl_5d'] | gap_hl['put_hl_5d']
                 # Find contiguous blocks of highlighted dates for 3D and 5D
@@ -2332,86 +2122,407 @@ with tab_signals:
                     "Unlike notional delta, volume is not inflated by time premium — it's a cleaner measure of raw activity.\n\n"
                     "**Green line** = 5-day MA. Above zero = more call volume (speculation), below = more put volume (hedging).")
 
-            # ==========================================
-            # CHART 8: NET OPEN INTEREST by DTE Bucket
-            # ==========================================
-            st.divider()
-            c_oi, c_oi_desc = st.columns([2, 1])
-            with c_oi:
-                fig_s7 = make_subplots(specs=[[{"secondary_y": True}]])
 
-                oi_net_pivot = pd.DataFrame()
-                if not call_oi_pivot.empty or not put_oi_pivot.empty:
-                    co = call_oi_pivot.reindex(columns=[b for b in dte_buckets_order if b in call_oi_pivot.columns], fill_value=0) if not call_oi_pivot.empty else pd.DataFrame(0, index=put_oi_pivot.index, columns=[b for b in dte_buckets_order if b in put_oi_pivot.columns])
-                    po = put_oi_pivot.reindex(columns=[b for b in dte_buckets_order if b in put_oi_pivot.columns], fill_value=0) if not put_oi_pivot.empty else pd.DataFrame(0, index=call_oi_pivot.index, columns=[b for b in dte_buckets_order if b in call_oi_pivot.columns])
-                    oi_net_pivot = co - po
-                    oi_net_pivot = oi_net_pivot.reindex(sorted(oi_net_pivot.index), fill_value=0)
 
-                if not oi_net_pivot.empty:
-                    for wi, bucket in enumerate(dte_buckets_order):
-                        if bucket in oi_net_pivot.columns:
-                            vals = oi_net_pivot[bucket]
-                            if abs(vals).sum() > 0:
-                                fig_s7.add_trace(go.Bar(x=oi_net_pivot.index, y=vals,
-                                    name=bucket, marker_color=dte_colors[wi], showlegend=True), secondary_y=False)
 
-                if not oi_net_pivot.empty:
-                    total_oi = oi_net_pivot.sum(axis=1)
-                    oi_5d = total_oi.rolling(5, min_periods=2).mean()
-                    fig_s7.add_trace(go.Scatter(x=total_oi.index, y=oi_5d,
-                        mode='lines', line=dict(color='#00CC96', width=2.5), name='OI 5D MA'), secondary_y=False)
-                    fig_s7.add_hline(y=0, line_color='white', line_width=1, opacity=0.4, secondary_y=False)
 
-                fig_s7.add_trace(go.Scatter(x=s_spot.index, y=s_spot.values, name="Spot Price", mode='lines',
-                    line=dict(color='white', width=2, dash='dot')), secondary_y=True)
 
-                fig_s7.update_layout(title="8. Net Far-OTM Open Interest (Calls − Puts) by DTE",
-                    template='plotly_dark', barmode='relative', bargap=0,
-                    height=350, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified',
-                    legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center", font=dict(size=9)))
-                fig_s7.update_xaxes(type='category', categoryorder='category ascending')
-                fig_s7.update_yaxes(title_text="Net Open Interest", secondary_y=False)
-                fig_s7.update_yaxes(showgrid=False, secondary_y=True)
-                st.plotly_chart(fig_s7, use_container_width=True)
-            with c_oi_desc:
-                st.info("**Net OI = Call OI minus Put OI for far-OTM options, stacked by DTE.**\n\n"
-                    "OI represents structural positioning (not daily flow). Changes here reflect shifts in longer-term conviction.\n\n"
-                    "**Green line** = 5-day MA. Above zero = more call OI (bullish positioning), below = more put OI (bearish positioning).")
+# ==========================================
+# TAB 6: SIGNALS
+# ==========================================
+if active_tab == "⚡ Signals":
+    st.header("⚡ Signals")
+    
+    sig_dates_t6 = sorted(ticker_chain['date_str'].dropna().unique())
+    if len(sig_dates_t6) == 0:
+        st.warning("No historical data available.")
+        st.stop()
+        
+    sig_start_t6 = sig_dates_t6[-60] if len(sig_dates_t6) >= 60 else sig_dates_t6[0]
+    sig_end_t6 = sig_dates_t6[-1]
+    sig_start_date_t6, sig_end_date_t6 = st.select_slider(
+        "Signal Detection Window:",
+        options=sig_dates_t6,
+        value=(sig_start_t6, sig_end_t6),
+        key="sig_tab_6_slider"
+    )
+    
+    # --- INDEPENDENT DATA PREP FOR TAB 6 ---
+    s_hist = ticker_chain[(ticker_chain['date_str'] >= sig_start_date_t6) & (ticker_chain['date_str'] <= sig_end_date_t6)].copy()
+    s_spot = s_hist.groupby('date_str')['underlying_price'].first()
+    spot_df = s_spot.reset_index(); spot_df.columns = ['date_str','spot']
+    
+    df_vwks = s_hist[(s_hist['side'] == 'CALL') & (s_hist['dte'].between(7, 45))].copy()
+    df_vwks['vwks_num'] = df_vwks['strike'] * df_vwks['volume']
+    agg_vwks_sig = df_vwks.groupby('date_str').apply(lambda x: (x['vwks_num'].sum() / x['volume'].sum()) if x['volume'].sum() > 0 else np.nan).rename('VWKS').reset_index()
+    agg_vwks_sig['VWKS_3D_MA'] = agg_vwks_sig['VWKS'].rolling(3, min_periods=1).mean()
+    agg_vwks_sig['VWKS_5D_MA'] = agg_vwks_sig['VWKS'].rolling(5, min_periods=3).mean()
+    
+    df_put = s_hist[(s_hist['side'] == 'PUT') & (s_hist['dte'].between(7, 45))].copy()
+    df_put['vwks_num_put'] = df_put['strike'] * df_put['volume']
+    agg_put_sig = df_put.groupby('date_str').apply(lambda x: (x['vwks_num_put'].sum() / x['volume'].sum()) if x['volume'].sum() > 0 else np.nan).rename('VWKS_PUT').reset_index()
+    agg_put_sig['VWKS_PUT_3D'] = agg_put_sig['VWKS_PUT'].rolling(3, min_periods=1).mean()
+    agg_put_sig['VWKS_PUT_5D'] = agg_put_sig['VWKS_PUT'].rolling(5, min_periods=3).mean()
+    
+    gap_hl = agg_vwks_sig[['date_str','VWKS_3D_MA','VWKS_5D_MA']].merge(agg_put_sig[['date_str','VWKS_PUT_3D','VWKS_PUT_5D']], on='date_str', how='inner').merge(spot_df, on='date_str', how='inner')
+    gap_hl['call_gap_5d'] = (gap_hl['spot'] - gap_hl['VWKS_5D_MA']) / gap_hl['spot'] * 100
+    gap_hl['call_hl_5d'] = (gap_hl['call_gap_5d'].abs() < 1) | (gap_hl['spot'] > gap_hl['VWKS_5D_MA'])
+    gap_hl['put_gap_5d'] = (gap_hl['spot'] - gap_hl['VWKS_PUT_5D']) / gap_hl['spot'] * 100
+    gap_hl['put_hl_5d'] = (gap_hl['put_gap_5d'].abs() < 1) | (gap_hl['spot'] < gap_hl['VWKS_PUT_5D'])
+    
+    far_call = s_hist[(s_hist['side'] == 'CALL') & (s_hist['delta'] > 0) & (s_hist['delta'] <= 0.10) & (s_hist['dte'] > 2)].copy()
+    far_put = s_hist[(s_hist['side'] == 'PUT') & (s_hist['delta'] < 0) & (s_hist['delta'] >= -0.10) & (s_hist['dte'] > 2)].copy()
+    far_call['dte_bucket'] = far_call['dte'].apply(lambda d: '2-7 DTE' if d<=7 else ('8-15 DTE' if d<=15 else ('16-30 DTE' if d<=30 else ('31-45 DTE' if d<=45 else '46+ DTE'))))
+    far_put['dte_bucket'] = far_put['dte'].apply(lambda d: '2-7 DTE' if d<=7 else ('8-15 DTE' if d<=15 else ('16-30 DTE' if d<=30 else ('31-45 DTE' if d<=45 else '46+ DTE'))))
+    call_oi_pivot = far_call.groupby(['date_str','dte_bucket'])['open_interest'].sum().unstack(fill_value=0) if 'dte_bucket' in far_call.columns else pd.DataFrame()
+    put_oi_pivot = far_put.groupby(['date_str','dte_bucket'])['open_interest'].sum().unstack(fill_value=0) if 'dte_bucket' in far_put.columns else pd.DataFrame()
+    dte_buckets_order = ['2-7 DTE','8-15 DTE','16-30 DTE','31-45 DTE','46+ DTE']
+    dte_colors = ['#EF553B','#FFA15A','#FECB52','#00CC96','#636EFA']
+    # ---------------------------------------
 
-            # ==========================================
-            # SIGNAL LOG TABLE
-            # ==========================================
-            st.divider()
-            st.subheader("📋 Recent Signal History")
+    # ==========================================
+    # CHART 8: NET OPEN INTEREST by DTE Bucket
+    # ==========================================
+    st.divider()
+    c_oi, c_oi_desc = st.columns([2, 1])
+    with c_oi:
+        fig_s7 = make_subplots(specs=[[{"secondary_y": True}]])
 
-            # Build signal log
-            all_signal_dates = set()
-            all_signal_dates.update(sig_m3_dates)
-            all_signal_dates.update(sig_m7_dates)
-            all_signal_dates.update(sig_m5_dates)
-            all_signal_dates.update(sig_bw2_dates)
-            all_signal_dates = sorted(all_signal_dates, reverse=True)[:20]
+        oi_net_pivot = pd.DataFrame()
+        if not call_oi_pivot.empty or not put_oi_pivot.empty:
+            co = call_oi_pivot.reindex(columns=[b for b in dte_buckets_order if b in call_oi_pivot.columns], fill_value=0) if not call_oi_pivot.empty else pd.DataFrame(0, index=put_oi_pivot.index, columns=[b for b in dte_buckets_order if b in put_oi_pivot.columns])
+            po = put_oi_pivot.reindex(columns=[b for b in dte_buckets_order if b in put_oi_pivot.columns], fill_value=0) if not put_oi_pivot.empty else pd.DataFrame(0, index=call_oi_pivot.index, columns=[b for b in dte_buckets_order if b in call_oi_pivot.columns])
+            oi_net_pivot = co - po
+            oi_net_pivot = oi_net_pivot.reindex(sorted(oi_net_pivot.index), fill_value=0)
 
-            if all_signal_dates:
-                log_rows = []
-                for ds in all_signal_dates:
-                    gap_v = agg_vwks_sig[agg_vwks_sig['date_str'] == ds]['smooth_gap_pct'].values
-                    gap_v = gap_v[0] if len(gap_v) > 0 else 0
-                    m3_f = "✅ Q1" if ds in sig_m3_q1_dates else ("⚠️ Q2-4" if ds in sig_m3_dates else "—")
-                    m7_f = "✅" if ds in sig_m7_dates else "—"
-                    m5_f = "✅" if ds in sig_m5_dates else "—"
-                    bw_f = "✅" if ds in sig_bw2_dates else "—"
-                    log_rows.append({"Date": ds, "Gap %": f"{gap_v:.2f}", "M3": m3_f, "M7": m7_f, "M5": m5_f, "BW2%": bw_f})
+        if not oi_net_pivot.empty:
+            total_oi = oi_net_pivot.sum(axis=1)
+            total_oi_diff3 = total_oi - total_oi.shift(3)
+            oi_diff_dict = total_oi_diff3.to_dict()
+            oi_val_dict = total_oi.to_dict()
 
-                st.dataframe(pd.DataFrame(log_rows), use_container_width=True, hide_index=True)
+            restricted_dates = fetch_restricted_earnings_dates(selected_ticker)
+            all_dates_c8 = sorted(set(agg_vwks_sig['date_str'])) if not agg_vwks_sig.empty else []
+            up_arrows = []
+            down_arrows = []
+            for d in all_dates_c8:
+                if 'gap_hl' in locals() and d in gap_hl['date_str'].values:
+                    row_hl = gap_hl[gap_hl['date_str'] == d].iloc[0]
+                    diff = oi_diff_dict.get(d, np.nan)
+                    curr_oi = oi_val_dict.get(d, 0)
+                    if pd.notna(diff) and d not in restricted_dates:
+                        call_trig = row_hl['call_hl_5d'] and diff < 0 and abs(curr_oi) > 20000
+                        put_trig = row_hl['put_hl_5d'] and diff > 0 and abs(curr_oi) > 20000
+                        if put_trig:
+                            up_arrows.append(d)
+                        if call_trig:
+                            down_arrows.append(d)
+
+            pos_sum = oi_net_pivot[oi_net_pivot > 0].sum(axis=1).max()
+            neg_sum = oi_net_pivot[oi_net_pivot < 0].sum(axis=1).min()
+            y_max_c8 = pos_sum * 1.05 if pd.notna(pos_sum) and pos_sum > 0 else 100
+            y_min_c8 = neg_sum * 1.05 if pd.notna(neg_sum) and neg_sum < 0 else -100
+
+            offset_up = y_min_c8 * 1.1 if y_min_c8 < 0 else -20
+            offset_down = y_min_c8 * 1.15 if y_min_c8 < 0 else -30
+
+            if up_arrows:
+                fig_s7.add_trace(go.Scatter(x=up_arrows, y=[offset_up]*len(up_arrows),
+                    mode='markers', marker=dict(symbol='triangle-up', size=14, color='#00CC96', line=dict(color='white', width=1)),
+                    name='Put VWKS Accumulation', showlegend=False, hoverinfo='skip'), secondary_y=False)
+            if down_arrows:
+                fig_s7.add_trace(go.Scatter(x=down_arrows, y=[offset_down]*len(down_arrows),
+                    mode='markers', marker=dict(symbol='triangle-down', size=14, color='#EF553B', line=dict(color='white', width=1)),
+                    name='Call VWKS Accumulation', showlegend=False, hoverinfo='skip'), secondary_y=False)
+
+            for wi, bucket in enumerate(dte_buckets_order):
+                if bucket in oi_net_pivot.columns:
+                    vals = oi_net_pivot[bucket]
+                    if abs(vals).sum() > 0:
+                        fig_s7.add_trace(go.Bar(x=oi_net_pivot.index, y=vals,
+                            name=bucket, marker_color=dte_colors[wi], showlegend=True), secondary_y=False)
+
+            fig_s7.add_hline(y=0, line_color='white', line_width=1, opacity=0.4, secondary_y=False)
+
+        if not agg_vwks_sig.empty:
+            fig_s7.add_trace(go.Scatter(x=agg_vwks_sig['date_str'], y=agg_vwks_sig['VWKS_5D_MA'],
+                name="Call VWKS 5D MA", mode='lines+markers', line=dict(color='#00CC96', width=2.5)), secondary_y=True)
+        if not agg_put_sig.empty:
+            fig_s7.add_trace(go.Scatter(x=agg_put_sig['date_str'], y=agg_put_sig['VWKS_PUT_5D'],
+                name="Put VWKS 5D MA", mode='lines+markers', line=dict(color='#EF553B', width=2.5)), secondary_y=True)
+
+        fig_s7.add_trace(go.Scatter(x=s_spot.index, y=s_spot.values, name="Spot Price", mode='lines',
+            line=dict(color='white', width=2, dash='dot')), secondary_y=True)
+
+        fig_s7.update_layout(title="8. Net Far-OTM Open Interest (Calls − Puts) by DTE",
+            template='plotly_dark', barmode='relative', bargap=0,
+            height=350, margin=dict(l=10, r=10, t=40, b=10), hovermode='x unified',
+            legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center", font=dict(size=9)))
+        fig_s7.update_xaxes(type='category', categoryorder='category ascending')
+        fig_s7.update_yaxes(title_text="Net Open Interest", secondary_y=False)
+        fig_s7.update_yaxes(showgrid=False, secondary_y=True)
+        st.plotly_chart(fig_s7, use_container_width=True)
+    with c_oi_desc:
+        st.info("**Net OI = Call OI minus Put OI for far-OTM options, stacked by DTE.**\n\n"
+            "OI represents structural positioning (not daily flow). Changes here reflect shifts in longer-term conviction.\n\n"
+            "**VWKS Lines** = 5-day MA for Calls (Green) and Puts (Red).\n\n"
+            "**Arrows** = Active accumulation signal (VWKS divergence + supportive 3-day net OI flow).")
+
+    st.divider()
+    render_omni_volatility(s_hist, s_hist, key_suffix="tab6")
+
+    # ==========================================
+    # MARKET WIDE ARROW SCANNER
+    # ==========================================
+    st.divider()
+    st.subheader("🎯 Market-Wide Accumulation Scanner")
+    st.markdown("Scan all tickers for active accumulation arrows on a specific date.")
+    
+    scan_c1, scan_c2 = st.columns([1, 3])
+    with scan_c1:
+        scan_date = st.selectbox("Select Scan Date:", available_dates, key="scan_date_sel")
+        scan_btn = st.button("Run Scanner", use_container_width=True, type="primary")
+    
+    if scan_btn:
+        with st.spinner(f"Scanning market for signals on {scan_date}..."):
+            @st.cache_data(ttl=3600)
+            def run_arrow_scanner(target_date, _con, bucket):
+                all_d = sorted(df_summary['date'].astype(str).str[:10].unique())
+                if target_date not in all_d: return pd.DataFrame()
+                
+                idx = all_d.index(target_date)
+                query = f"SELECT * FROM read_parquet('s3://{bucket}/dashboard_data/scanner_gold.parquet') WHERE date_str = '{target_date}'"
+                
+                try:
+                    target_df = _con.execute(query).df()
+                except Exception as e:
+                    st.error(f"Scanner Database Error: {e}")
+                    return pd.DataFrame()
+                
+                if target_df.empty: return pd.DataFrame()
+                
+                # Vectorized filtering to avoid sequential API calls for non-triggered tickers
+                call_trig_mask = (target_df['call_hl_5d'] == True) & target_df['net_oi_diff3'].notna() & (target_df['net_oi_diff3'] < 0) & (target_df['net_oi'].abs() > 20000)
+                put_trig_mask = (target_df['put_hl_5d'] == True) & target_df['net_oi_diff3'].notna() & (target_df['net_oi_diff3'] > 0) & (target_df['net_oi'].abs() > 20000)
+                
+                triggered_df = target_df[call_trig_mask | put_trig_mask].copy()
+                
+                results = []
+                for _, row in triggered_df.iterrows():
+                    tckr = row['ticker']
+                    
+                    # Fetch earnings only for triggered tickers
+                    restricted = fetch_restricted_earnings_dates(tckr)
+                    if target_date in restricted:
+                        continue
+                        
+                    call_trig = (row['call_hl_5d'] == True) and pd.notna(row['net_oi_diff3']) and row['net_oi_diff3'] < 0 and abs(row['net_oi']) > 20000
+                    
+                    results.append({
+                        'Ticker': tckr,
+                        'Signal': 'CALL VWKS ACCUMULATION 🔻' if call_trig else 'PUT VWKS ACCUMULATION 🟢 ⬆️',
+                        'Spot': row['spot'],
+                        'VWKS (5D)': row['VWKS_5D_MA'] if call_trig else row['VWKS_PUT_5D'],
+                        '3D Net OI Flow': row['net_oi_diff3'],
+                        'Total Net OI': row['net_oi'],
+                        'Distance to VWKS (%)': row['call_gap_5d'] if call_trig else row['put_gap_5d']
+                    })
+                
+                return pd.DataFrame(results)
+
+            res_df = run_arrow_scanner(scan_date, db_con, bucket_name)
+            if not res_df.empty:
+                res_df['Total Net OI'] = res_df['Total Net OI'].apply(lambda x: f"{x:,.0f}")
+                res_df['3D Net OI Flow'] = res_df['3D Net OI Flow'].apply(lambda x: f"{x:,.0f}")
+                st.dataframe(res_df, use_container_width=True, hide_index=True)
+                st.success(f"Found {len(res_df)} tickers with signals on {scan_date}.")
             else:
-                st.info("No signals detected in the selected window.")
+                st.info(f"No signals found across any tickers on {scan_date}.")
 
+# ==========================================
+# TAB 7: TRADE IDEAS
+# ==========================================
+if active_tab == "🏆 Trade Ideas":
+    st.header("🏆 Fresh Trade Idea Models")
+    st.markdown("Automated screening for anomalies, decoupling, and accumulation setups.")
+    
+    # 1. Volatility Surface anomalies
+    st.subheader("1. Volatility Surface Anomalies")
+    st.markdown("Hunt for anomalies where IV significantly deviates from the normal surface, potentially highlighting large customer buying disguised by 0DTE or MM washing.")
+    if not current_chain.empty and spot_price > 0:
+        c_anom = current_chain.copy()
+        # Filter low volume to focus on real bets
+        c_anom = c_anom[c_anom['volume'] > 50].copy()
+        # Filter to strikes within +/- 20% of spot
+        c_anom = c_anom[(c_anom['strike'] >= spot_price * 0.8) & (c_anom['strike'] <= spot_price * 1.2)].copy()
+        
+        if not c_anom.empty and 'iv' in c_anom.columns:
+            # Drop NAs
+            c_anom = c_anom.dropna(subset=['iv', 'dte'])
+            # Round strikes to nearest .5 or whole number
+            c_anom['strike'] = c_anom['strike'].apply(lambda x: round(x * 2) / 2)
+            # Create DTE buckets
+            c_anom['dte_bucket'] = pd.cut(c_anom['dte'], bins=[-1, 3, 7, 30, 90, 365, 1000], labels=['0-3', '4-7', '8-30', '31-90', '91-365', '365+'])
+            
+            # Calculate mean and std per side and dte bucket
+            bucket_stats = c_anom.groupby(['side', 'dte_bucket'], observed=False)['iv'].agg(['mean', 'std']).reset_index()
+            c_anom = c_anom.merge(bucket_stats, on=['side', 'dte_bucket'], suffixes=('', '_bucket'))
+            
+            c_anom['z_score'] = (c_anom['iv'] - c_anom['mean']) / (c_anom['std'] + 1e-9)
+            anomalies = c_anom[c_anom['z_score'] > 2.0].sort_values('z_score', ascending=False).head(15)
+            
+            if not anomalies.empty:
+                fig_anom = px.scatter(
+                    anomalies, x="strike", y="iv", color="side", size="volume", 
+                    hover_data=["expiration", "dte", "z_score", "open_interest"],
+                    title="Top Volatility Surface Anomalies (Z-Score > 2.0)",
+                    template="plotly_dark", color_discrete_map={'CALL': '#00CC96', 'PUT': '#EF553B'}
+                )
+                fig_anom.add_vline(x=spot_price, line_dash="dash", line_color="white", annotation_text="Spot")
+                st.plotly_chart(fig_anom, use_container_width=True)
+                
+                disp_anom = anomalies[['expiration', 'strike', 'side', 'iv', 'volume', 'open_interest', 'z_score']].copy()
+                st.dataframe(disp_anom.style.format({'iv': '{:.2%}', 'z_score': '{:.2f}', 'strike': '{:g}'}), use_container_width=True)
+            else:
+                st.info("No significant volatility surface anomalies detected today.")
+        else:
+            st.warning("Insufficient data for Volatility Anomalies.")
+            
+    # 2. Volatility decoupling
+    st.divider()
+    st.subheader("2. Volatility Decoupling Tracker")
+    st.markdown("Identify days where ATM IV decoupled from Spot Price movements (e.g. Spot Up + IV Up, or Spot Down + IV Down).")
+    
+    valid_dates_dec = sorted(ticker_chain['date_str'].dropna().unique())
+    if len(valid_dates_dec) > 10:
+        hist_dec = ticker_chain.groupby('date_str')['underlying_price'].first().reset_index()
+        
+        atm_ivs = []
+        for d in hist_dec['date_str']:
+            chain_d = ticker_chain[ticker_chain['date_str'] == d]
+            if not chain_d.empty:
+                s = chain_d['underlying_price'].iloc[0]
+                chain_d_copy = chain_d.copy()
+                chain_d_copy['dist'] = (chain_d_copy['strike'] - s).abs()
+                min_dist = chain_d_copy['dist'].min()
+                a_iv = chain_d_copy[chain_d_copy['dist'] == min_dist]['iv'].mean()
+                atm_ivs.append(a_iv)
+            else:
+                atm_ivs.append(np.nan)
+                
+        hist_dec['atm_iv'] = atm_ivs
+        hist_dec = hist_dec.dropna()
+        
+        hist_dec['spot_ret'] = hist_dec['underlying_price'].pct_change()
+        hist_dec['iv_ret'] = hist_dec['atm_iv'].pct_change()
+        
+        hist_dec['decoupled'] = np.where((hist_dec['spot_ret'] > 0.005) & (hist_dec['iv_ret'] > 0.02), 'Call Buying (Spot Up + IV Up)',
+                              np.where((hist_dec['spot_ret'] < -0.005) & (hist_dec['iv_ret'] < -0.02), 'Put Selling (Spot Down + IV Down)', 'Normal'))
+                              
+        fig_dec = make_subplots(specs=[[{"secondary_y": True}]])
+        fig_dec.add_trace(go.Scatter(x=hist_dec['date_str'], y=hist_dec['underlying_price'], name="Spot Price", line=dict(color='white', width=2)), secondary_y=False)
+        fig_dec.add_trace(go.Scatter(x=hist_dec['date_str'], y=hist_dec['atm_iv'], name="ATM IV", line=dict(color='#FECB52', width=2)), secondary_y=True)
+        
+        anom_up = hist_dec[hist_dec['decoupled'] == 'Call Buying (Spot Up + IV Up)']
+        anom_dn = hist_dec[hist_dec['decoupled'] == 'Put Selling (Spot Down + IV Down)']
+        
+        if not anom_up.empty:
+            fig_dec.add_trace(go.Scatter(x=anom_up['date_str'], y=anom_up['underlying_price'], mode='markers', name='Call Buying (Decoupled)', marker=dict(color='#00CC96', size=12, symbol='triangle-up')), secondary_y=False)
+        if not anom_dn.empty:
+            fig_dec.add_trace(go.Scatter(x=anom_dn['date_str'], y=anom_dn['underlying_price'], mode='markers', name='Put Selling (Decoupled)', marker=dict(color='#EF553B', size=12, symbol='triangle-down')), secondary_y=False)
+            
+        fig_dec.update_layout(template="plotly_dark", hovermode="x unified", title="Spot vs ATM IV Macro Decoupling", height=400)
+        fig_dec.update_yaxes(title_text="Spot Price", secondary_y=False)
+        fig_dec.update_yaxes(title_text="ATM IV", secondary_y=True)
+        st.plotly_chart(fig_dec, use_container_width=True)
+
+    # 3. OI Accumulation Efficiency Ratio
+    st.divider()
+    st.subheader("3. OI Accumulation Efficiency Ratio")
+    st.markdown("Ratio of **Δ OI / Volume** from the previous day. High efficiency (>70%) on 7-45 DTE expirations flags 'sticky' institutional positioning rather than day-trading washes.")
+    
+    dates = valid_dates_dec
+    if len(dates) >= 2:
+        idx = dates.index(selected_date) if selected_date in dates else 0
+        if idx > 0:
+            yest_date = dates[idx - 1]
+            df_tdy = current_chain.copy()
+            df_yest = ticker_chain[ticker_chain['date_str'] == yest_date][['expiration', 'strike', 'side', 'open_interest', 'volume']].copy()
+            
+            df_eff = df_tdy.merge(df_yest, on=['expiration', 'strike', 'side'], suffixes=('', '_yest'))
+            df_eff['oi_delta'] = df_eff['open_interest'] - df_eff['open_interest_yest']
+            
+            # Efficiency based on yesterday's volume
+            df_eff['strike'] = df_eff['strike'].apply(lambda x: round(x * 2) / 2)
+            df_eff = df_eff[(df_eff['volume_yest'] > 100) & (df_eff['dte'].between(7, 45))].copy()
+            df_eff['efficiency'] = np.where(df_eff['volume_yest'] > 0, df_eff['oi_delta'] / df_eff['volume_yest'], 0)
+            
+            highly_eff = df_eff[df_eff['efficiency'] > 0.70].sort_values('efficiency', ascending=False)
+            
+            if not highly_eff.empty:
+                disp_eff = highly_eff[['expiration', 'strike', 'side', 'oi_delta', 'volume_yest', 'efficiency']].copy()
+                st.dataframe(disp_eff.style.format({'efficiency': '{:.1%}', 'oi_delta': '+{:,.0f}', 'volume_yest': '{:,.0f}', 'strike': '{:g}'}), use_container_width=True)
+            else:
+                st.info("No high-efficiency ( >70% ) OI builds detected in the 7-45 DTE range based on yesterday's volume.")
+        else:
+            st.warning("No previous day data available to calculate OI efficiency. Please select a date with a prior trading day.")
+            
+    # 4. Term Structure Shift
+    st.divider()
+    st.subheader("4. The 'Term Structure' Shift")
+    st.markdown("Detects unusual shifts in volume distribution across expirations compared to a 10-day historical average. Sudden volume shifting to long-term dates indicates institutional entry.")
+    
+    if len(dates) > 10:
+        idx = dates.index(selected_date) if selected_date in dates else len(dates)-1
+        hist_10d_dates = dates[max(0, idx - 10):idx]
+        hist_10d_chain = ticker_chain[ticker_chain['date_str'].isin(hist_10d_dates)].copy()
+        
+        def categorize_dte(dte):
+            if pd.isna(dte): return 'Unknown'
+            if dte <= 7: return '0-7 DTE'
+            elif dte <= 30: return '8-30 DTE'
+            elif dte <= 60: return '31-60 DTE'
+            elif dte <= 90: return '61-90 DTE'
+            else: return '90+ DTE'
+            
+        hist_10d_chain['dte_cat'] = hist_10d_chain['dte'].apply(categorize_dte)
+        df_tdy = current_chain.copy()
+        df_tdy['dte_cat'] = df_tdy['dte'].apply(categorize_dte)
+        
+        hist_daily_cat = hist_10d_chain.groupby(['date_str', 'dte_cat'])['volume'].sum().reset_index()
+        hist_daily_total = hist_10d_chain.groupby('date_str')['volume'].sum().reset_index()
+        
+        hist_merged = hist_daily_cat.merge(hist_daily_total, on='date_str', suffixes=('', '_total'))
+        hist_merged['pct_of_total'] = np.where(hist_merged['volume_total'] > 0, hist_merged['volume'] / hist_merged['volume_total'], 0)
+        
+        hist_avg_dist = hist_merged.groupby('dte_cat')['pct_of_total'].mean().reset_index().rename(columns={'pct_of_total': 'hist_avg_pct'})
+        
+        tdy_cat_vol = df_tdy.groupby('dte_cat')['volume'].sum().reset_index()
+        tdy_total_vol = tdy_cat_vol['volume'].sum()
+        tdy_cat_vol['tdy_pct'] = np.where(tdy_total_vol > 0, tdy_cat_vol['volume'] / tdy_total_vol, 0)
+        
+        shift_df = hist_avg_dist.merge(tdy_cat_vol, on='dte_cat', how='outer').fillna(0)
+        shift_df['shift'] = shift_df['tdy_pct'] - shift_df['hist_avg_pct']
+        
+        # Sort DTE categories logically
+        cat_order = ['0-7 DTE', '8-30 DTE', '31-60 DTE', '61-90 DTE', '90+ DTE']
+        shift_df['dte_cat'] = pd.Categorical(shift_df['dte_cat'], categories=cat_order, ordered=True)
+        shift_df = shift_df.sort_values('dte_cat')
+        
+        fig_shift = go.Figure()
+        fig_shift.add_trace(go.Bar(x=shift_df['dte_cat'], y=shift_df['hist_avg_pct'], name="10-Day Avg %", marker_color='rgba(255, 255, 255, 0.3)'))
+        fig_shift.add_trace(go.Bar(x=shift_df['dte_cat'], y=shift_df['tdy_pct'], name="Today's %", marker_color='#FECB52'))
+        fig_shift.update_layout(template="plotly_dark", barmode='group', height=400, yaxis_tickformat='.1%')
+        st.plotly_chart(fig_shift, use_container_width=True)
+        
+        significant_shifts = shift_df[(shift_df['shift'] > 0.10) & (shift_df['dte_cat'].isin(['31-60 DTE', '61-90 DTE', '90+ DTE']))]
+        if not significant_shifts.empty:
+            st.success("🚨 **INSTITUTIONAL SHIFT DETECTED:** Significant volume has shifted to longer-term expirations today compared to historical averages.")
 
 # ==========================================
 # TAB 8: INSTITUTIONAL SURFACE HEATMAP (LADDER)
 # ==========================================
-with tab_heatmap:
+if active_tab == "🌡️ Surface Heatmap":
     st.header("🌡️ Options Surface Heatmap")
     st.markdown("A 3D grid visualizing exposure and flow across the entire matrix of strikes and expirations.")
 
@@ -2422,7 +2533,7 @@ with tab_heatmap:
         heat_metric = st.selectbox("Select Display Metric:",
                                    ["Gamma Exposure (Net GEX)", "Notional Delta (Net DEX)",
                                     "Notional Premium (Net Prem)", "Total Volume", "Daily Δ Open Interest",
-                                    "Total Open Interest (+ Daily Δ)"],
+                                    "Total Open Interest (+ Daily Δ)", "Volume vs OI (Vol - OI)"],
                                    label_visibility="collapsed")
     with c_heat_side:
         heat_side = st.radio("Side:", ["Both", "Calls Only", "Puts Only"], horizontal=True,
@@ -2493,6 +2604,11 @@ with tab_heatmap:
             df_heat['sub_val'] = df_heat['oi_delta']
             prefix, is_diverging = "", False
 
+        elif heat_metric == "Volume vs OI (Vol - OI)":
+            df_heat['val'] = df_heat['volume'] - df_heat['open_interest']
+            df_heat['sub_val'] = 0
+            prefix, is_diverging = "", True
+
         if not df_heat.empty:
             agg_heat = df_heat.groupby(['strike', 'expiration'])[['val', 'sub_val']].sum().reset_index()
 
@@ -2528,10 +2644,10 @@ with tab_heatmap:
                 ascending=True)
 
             if is_diverging:
-                color_scale = [[0.0, '#5B2C6F'], [0.5, '#1e3a8a'], [1.0, '#00CC96']]
+                color_scale = [[0.0, '#FF3333'], [0.499, '#111111'], [0.5, '#222222'], [1.0, '#00FF00']]
                 zmid = 0
             else:
-                color_scale = [[0.0, '#1e3a8a'], [1.0, '#00CC96']]
+                color_scale = [[0.0, '#111111'], [1.0, '#00FF00']]
                 zmid = None
 
             fig_hm = go.Figure(data=go.Heatmap(
@@ -2549,5 +2665,617 @@ with tab_heatmap:
                                             tickformat=".1f"))
 
             st.plotly_chart(fig_hm, use_container_width=True)
+            
+            # --- KPI CONTEXT TABLE ---
+            st.divider()
+            st.subheader(f"Historical KPI Context: {heat_metric} (Single Contract)")
+            st.markdown("Context is based on individual contracts over the last 90 days (excluding < 2 DTE).")
+            
+            dates_all = sorted(ticker_chain['date_str'].dropna().unique())
+            dates_90d = dates_all[-90:] if len(dates_all) > 90 else dates_all
+            chain_90d = ticker_chain[ticker_chain['date_str'].isin(dates_90d)].copy()
+            
+            # Filter out < 2 DTE
+            chain_90d = chain_90d[chain_90d['dte'] >= 2].copy()
+            
+            if heat_metric == "Total Volume":
+                chain_90d['val'] = chain_90d['volume']
+            elif heat_metric == "Total Open Interest (+ Daily Δ)":
+                chain_90d['val'] = chain_90d['open_interest']
+            elif heat_metric == "Volume vs OI (Vol - OI)":
+                chain_90d['val'] = chain_90d['volume'] - chain_90d['open_interest']
+            elif heat_metric == "Gamma Exposure (Net GEX)":
+                chain_90d['val'] = np.where(chain_90d['side'] == 'CALL', pd.to_numeric(chain_90d['gamma'], errors='coerce') * chain_90d['open_interest'] * 100 * chain_90d['underlying_price'], -pd.to_numeric(chain_90d['gamma'], errors='coerce') * chain_90d['open_interest'] * 100 * chain_90d['underlying_price'])
+            elif heat_metric == "Notional Delta (Net DEX)":
+                chain_90d['val'] = np.where(chain_90d['side'] == 'CALL', pd.to_numeric(chain_90d['delta'], errors='coerce').abs() * chain_90d['open_interest'] * 100 * chain_90d['underlying_price'], -pd.to_numeric(chain_90d['delta'], errors='coerce').abs() * chain_90d['open_interest'] * 100 * chain_90d['underlying_price'])
+            elif heat_metric == "Notional Premium (Net Prem)":
+                chain_90d['val'] = np.where(chain_90d['side'] == 'CALL', chain_90d['open_interest'] * chain_90d['last_price'] * 100, -chain_90d['open_interest'] * chain_90d['last_price'] * 100)
+            else:
+                chain_90d['val'] = np.nan
+                
+            if not chain_90d.empty and not df_heat.empty:
+                # If metric is diverging, take absolute values for the distribution (magnitude of size)
+                if heat_metric in ["Gamma Exposure (Net GEX)", "Notional Delta (Net DEX)", "Notional Premium (Net Prem)", "Volume vs OI (Vol - OI)", "Daily Δ Open Interest"]:
+                    chain_90d['val'] = chain_90d['val'].abs()
+                    today_max_val = df_heat['val'].abs().max()
+                else:
+                    today_max_val = df_heat['val'].max()
+                
+                # Get the Daily Maximum contract size for the last 90 days
+                daily_maxes = chain_90d.groupby('date_str')['val'].max().dropna()
+                
+                if len(daily_maxes) > 0:
+                    avg_90d = daily_maxes.mean()
+                    p90 = daily_maxes.quantile(0.90)
+                    p_rank = (daily_maxes <= today_max_val).mean() * 100
+                    
+                    c1, c2, c3, c4 = st.columns(4)
+                    prefix_str = "$" if "Notional" in heat_metric or "Gamma" in heat_metric else ""
+                    c1.metric("Today's Max (Selected View)", f"{prefix_str}{today_max_val:,.0f}")
+                    c2.metric("90-Day Avg of Daily Maxes", f"{prefix_str}{avg_90d:,.0f}")
+                    c3.metric("90th Percentile of Daily Maxes", f"{prefix_str}{p90:,.0f}")
+                    c4.metric("Current Max Percentile Rank", f"{p_rank:.0f}%")
+# TAB 8: INSTITUTIONAL SURFACE HEATMAP (LADDER)
+# ==========================================
+if active_tab == "🌡️ Surface Heatmap":
+    st.header("🌡️ Options Surface Heatmap")
+    st.markdown("A 3D grid visualizing exposure and flow across the entire matrix of strikes and expirations.")
+
+    # --- CONTROLS ---
+    c_heat_met, c_heat_side, c_heat_dte, c_heat_strike = st.columns([2, 1, 1, 1])
+    with c_heat_met:
+        # NEW: Added Notional Premium metric
+        heat_metric = st.selectbox("Select Display Metric:",
+                                   ["Gamma Exposure (Net GEX)", "Notional Delta (Net DEX)",
+                                    "Notional Premium (Net Prem)", "Total Volume", "Daily Δ Open Interest",
+                                    "Total Open Interest (+ Daily Δ)", "Volume vs OI (Vol - OI)"],
+                                   label_visibility="collapsed")
+    with c_heat_side:
+        heat_side = st.radio("Side:", ["Both", "Calls Only", "Puts Only"], horizontal=True,
+                             label_visibility="collapsed")
+    with c_heat_dte:
+        heat_max_dte = st.slider("Max DTE Window:", min_value=7, max_value=180, value=45)
+    with c_heat_strike:
+        heat_strike_range = st.slider("Strike Range (+/- % from Spot):", min_value=5, max_value=30, value=15)
+
+    if not current_chain.empty and spot_price > 0:
+        df_heat = current_chain.copy()
+        if heat_side == "Calls Only":
+            df_heat = df_heat[df_heat['side'] == 'CALL']
+        elif heat_side == "Puts Only":
+            df_heat = df_heat[df_heat['side'] == 'PUT']
+
+        df_heat = df_heat[(df_heat['dte'] <= heat_max_dte) &
+                          (df_heat['strike'] >= spot_price * (1 - heat_strike_range / 100)) &
+                          (df_heat['strike'] <= spot_price * (1 + heat_strike_range / 100))].copy()
+
+        dates = sorted(ticker_chain['date_str'].dropna().unique())
+        curr_idx = dates.index(selected_date) if selected_date in dates else 0
+        yest_date = dates[curr_idx - 1] if curr_idx > 0 else None
+
+        if yest_date:
+            df_yest = ticker_chain[ticker_chain['date_str'] == yest_date][
+                ['expiration', 'strike', 'side', 'open_interest']]
+            df_heat = df_heat.merge(df_yest, on=['expiration', 'strike', 'side'], how='left',
+                                    suffixes=('', '_yest')).fillna({'open_interest_yest': 0})
+            df_heat['oi_delta'] = df_heat['open_interest'] - df_heat['open_interest_yest']
+        else:
+            df_heat['oi_delta'] = 0
+
+        # Calculate Selected Metric
+        if heat_metric == "Gamma Exposure (Net GEX)":
+            df_heat['val'] = np.where(df_heat['side'] == 'CALL',
+                                      df_heat['gamma'] * df_heat['open_interest'] * 100 * spot_price,
+                                      -df_heat['gamma'] * df_heat['open_interest'] * 100 * spot_price)
+            df_heat['sub_val'] = 0
+            prefix, is_diverging = "$", True
+
+        elif heat_metric == "Notional Delta (Net DEX)":
+            df_heat['val'] = np.where(df_heat['side'] == 'CALL',
+                                      df_heat['delta'].abs() * df_heat['open_interest'] * 100 * spot_price,
+                                      -df_heat['delta'].abs() * df_heat['open_interest'] * 100 * spot_price)
+            df_heat['sub_val'] = 0
+            prefix, is_diverging = "$", True
+
+        elif heat_metric == "Notional Premium (Net Prem)":
+            # NEW: Premium mapping. Call Premium is positive (+), Put Premium is negative (-)
+            df_heat['val'] = np.where(df_heat['side'] == 'CALL', df_heat['open_interest'] * df_heat['last_price'] * 100,
+                                      -df_heat['open_interest'] * df_heat['last_price'] * 100)
+            df_heat['sub_val'] = 0
+            prefix, is_diverging = "$", True
+
+        elif heat_metric == "Total Volume":
+            df_heat['val'] = df_heat['volume']
+            df_heat['sub_val'] = 0
+            prefix, is_diverging = "", False
+
+        elif heat_metric == "Daily Δ Open Interest":
+            df_heat['val'] = np.where(df_heat['side'] == 'CALL', df_heat['oi_delta'], -df_heat['oi_delta'])
+            df_heat['sub_val'] = 0
+            prefix, is_diverging = "", True
+
+        elif heat_metric == "Total Open Interest (+ Daily Δ)":
+            df_heat['val'] = df_heat['open_interest']
+            df_heat['sub_val'] = df_heat['oi_delta']
+            prefix, is_diverging = "", False
+
+        elif heat_metric == "Volume vs OI (Vol - OI)":
+            df_heat['val'] = df_heat['volume'] - df_heat['open_interest']
+            df_heat['sub_val'] = 0
+            prefix, is_diverging = "", True
+
+        if not df_heat.empty:
+            agg_heat = df_heat.groupby(['strike', 'expiration'])[['val', 'sub_val']].sum().reset_index()
+
+
+            def format_num(x, pref=""):
+                if pd.isna(x): return ""
+                sign = "-" if x < 0 else ""
+                val = abs(x)
+                if val >= 1_000_000:
+                    return f"{sign}{pref}{val / 1_000_000:.1f}M"
+                elif val >= 1_000:
+                    return f"{sign}{pref}{val / 1_000:.1f}K"
+                else:
+                    return f"{sign}{pref}{val:.0f}"
+
+
+            def generate_cell_text(row):
+                v, sv = row['val'], row['sub_val']
+                if v == 0 and sv == 0: return ""
+                main_str = format_num(v, prefix) if v != 0 else "0"
+                if heat_metric == "Total Open Interest (+ Daily Δ)":
+                    sub_sign = "+" if sv > 0 else ""
+                    sub_str = format_num(sv, "") if sv != 0 else "0"
+                    return f"{main_str} ({sub_sign}{sub_str})"
+                return main_str
+
+
+            agg_heat['text_col'] = agg_heat.apply(generate_cell_text, axis=1)
+
+            pivot_matrix = agg_heat.pivot(index='strike', columns='expiration', values='val').fillna(0).sort_index(
+                ascending=True)
+            text_matrix = agg_heat.pivot(index='strike', columns='expiration', values='text_col').fillna("").sort_index(
+                ascending=True)
+
+            if is_diverging:
+                color_scale = [[0.0, '#FF3333'], [0.499, '#111111'], [0.5, '#222222'], [1.0, '#00FF00']]
+                zmid = 0
+            else:
+                color_scale = [[0.0, '#111111'], [1.0, '#00FF00']]
+                zmid = None
+
+            fig_hm = go.Figure(data=go.Heatmap(
+                z=pivot_matrix.values, x=pivot_matrix.columns, y=pivot_matrix.index, text=text_matrix.values,
+                texttemplate="%{text}", colorscale=color_scale, zmid=zmid, showscale=False, xgap=2, ygap=2,
+                hovertemplate="<b>Strike:</b> $%{y}<br><b>Exp:</b> %{x}<br><b>Data:</b> %{text}<extra></extra>"
+            ))
+
+            fig_hm.add_hline(y=spot_price, line_dash="solid", line_color="white", line_width=2, annotation_text="Spot",
+                             annotation_position="left")
+            fig_hm.update_layout(template='plotly_dark', height=850, margin=dict(l=10, r=10, t=30, b=10),
+                                 xaxis=dict(title=None, side='top', tickangle=0, type='category', categoryorder='array',
+                                            categoryarray=pivot_matrix.columns),
+                                 yaxis=dict(title="Strike Price", tickmode='array', tickvals=pivot_matrix.index,
+                                            tickformat=".1f"))
+
+            st.plotly_chart(fig_hm, use_container_width=True)
+            
+            # --- KPI CONTEXT TABLE ---
+            st.divider()
+            st.subheader(f"Historical KPI Context: {heat_metric} (Single Contract)")
+            st.markdown("Context is based on individual contracts over the last 90 days (excluding < 2 DTE).")
+            
+            dates_all = sorted(ticker_chain['date_str'].dropna().unique())
+            dates_90d = dates_all[-90:] if len(dates_all) > 90 else dates_all
+            chain_90d = ticker_chain[ticker_chain['date_str'].isin(dates_90d)].copy()
+            
+            # Filter out < 2 DTE
+            chain_90d = chain_90d[chain_90d['dte'] >= 2].copy()
+            
+            if heat_metric == "Total Volume":
+                chain_90d['val'] = chain_90d['volume']
+            elif heat_metric == "Total Open Interest (+ Daily Δ)":
+                chain_90d['val'] = chain_90d['open_interest']
+            elif heat_metric == "Volume vs OI (Vol - OI)":
+                chain_90d['val'] = chain_90d['volume'] - chain_90d['open_interest']
+            elif heat_metric == "Gamma Exposure (Net GEX)":
+                chain_90d['val'] = np.where(chain_90d['side'] == 'CALL', pd.to_numeric(chain_90d['gamma'], errors='coerce') * chain_90d['open_interest'] * 100 * chain_90d['underlying_price'], -pd.to_numeric(chain_90d['gamma'], errors='coerce') * chain_90d['open_interest'] * 100 * chain_90d['underlying_price'])
+            elif heat_metric == "Notional Delta (Net DEX)":
+                chain_90d['val'] = np.where(chain_90d['side'] == 'CALL', pd.to_numeric(chain_90d['delta'], errors='coerce').abs() * chain_90d['open_interest'] * 100 * chain_90d['underlying_price'], -pd.to_numeric(chain_90d['delta'], errors='coerce').abs() * chain_90d['open_interest'] * 100 * chain_90d['underlying_price'])
+            elif heat_metric == "Notional Premium (Net Prem)":
+                chain_90d['val'] = np.where(chain_90d['side'] == 'CALL', chain_90d['open_interest'] * chain_90d['last_price'] * 100, -chain_90d['open_interest'] * chain_90d['last_price'] * 100)
+            else:
+                chain_90d['val'] = np.nan
+                
+            if not chain_90d.empty and not df_heat.empty:
+                # If metric is diverging, take absolute values for the distribution (magnitude of size)
+                if heat_metric in ["Gamma Exposure (Net GEX)", "Notional Delta (Net DEX)", "Notional Premium (Net Prem)", "Volume vs OI (Vol - OI)", "Daily Δ Open Interest"]:
+                    chain_90d['val'] = chain_90d['val'].abs()
+                    today_max_val = df_heat['val'].abs().max()
+                else:
+                    today_max_val = df_heat['val'].max()
+                
+                # Get the Daily Maximum contract size for the last 90 days
+                daily_maxes = chain_90d.groupby('date_str')['val'].max().dropna()
+                
+                if len(daily_maxes) > 0:
+                    avg_90d = daily_maxes.mean()
+                    p90 = daily_maxes.quantile(0.90)
+                    p_rank = (daily_maxes <= today_max_val).mean() * 100
+                    
+                    c1, c2, c3, c4 = st.columns(4)
+                    prefix_str = "$" if "Notional" in heat_metric or "Gamma" in heat_metric else ""
+                    c1.metric("Today's Max (Selected View)", f"{prefix_str}{today_max_val:,.0f}")
+                    c2.metric("90-Day Avg of Daily Maxes", f"{prefix_str}{avg_90d:,.0f}")
+                    c3.metric("90th Percentile of Daily Maxes", f"{prefix_str}{p90:,.0f}")
+                    c4.metric("Current Max Percentile Rank", f"{p_rank:.0f}%")
+                else:
+                    st.info(f"Historical context unavailable for {heat_metric}.")
+            else:
+                st.info(f"Historical context unavailable for {heat_metric}.")
+
         else:
             st.warning("No data found for this specific DTE and Strike range combination.")
+
+# ==========================================
+# TAB 8: SHORT VOLUME
+# ==========================================
+if active_tab == "📉 Short Volume":
+    st.header(f"📉 FINRA Advanced Short Volume Models for {selected_ticker}")
+    st.markdown("Multi-model analysis combining off-exchange short selling activity with options and price data.")
+    
+    finra_path = f"s3://{bucket_name}/dashboard_data/finra_short_volume_gold.parquet"
+    
+    try:
+        # Load FINRA data for selected ticker (Last 365 days for performance)
+        query = f"SELECT * FROM read_parquet('{finra_path}') WHERE Symbol = '{selected_ticker}' AND Date >= current_date - INTERVAL 365 DAYS ORDER BY Date ASC"
+        df_finra = db_con.execute(query).df()
+    except Exception as e:
+        df_finra = pd.DataFrame()
+        
+    if df_finra.empty:
+        st.warning(f"No FINRA short volume data found for {selected_ticker}. Backfill may be required or data does not exist.")
+    else:
+        # Merge FINRA data with ticker_summary for Price and Options data
+        # Ensure dates match for merging
+        df_finra['date_str'] = df_finra['Date'].dt.strftime('%Y-%m-%d')
+        
+        # Merge with ticker_summary
+        if not ticker_summary.empty:
+            merged_df = df_finra.merge(ticker_summary[['date_str', 'total_volume', 'put_call_ratio_vol']], on='date_str', how='left')
+        else:
+            merged_df = df_finra.copy()
+            merged_df['put_call_ratio_vol'] = np.nan
+            
+        # Get daily price from yfinance (1 year of history)
+        import yfinance as yf
+        try:
+            yf_ticker = yf.Ticker(selected_ticker)
+            hist = yf_ticker.history(period="1y")
+            hist = hist.reset_index()
+            # yfinance returns timezone-aware dates, need to format to string
+            hist['date_str'] = pd.to_datetime(hist['Date'], utc=True).dt.tz_convert('America/New_York').dt.strftime('%Y-%m-%d')
+            daily_price = hist[['date_str', 'Close']].rename(columns={'Close': 'close'})
+            merged_df = merged_df.merge(daily_price, on='date_str', how='left')
+        except Exception as e:
+            st.warning(f"Failed to fetch price from yfinance: {e}")
+            merged_df['close'] = np.nan
+            
+        # Merge with ticker_chain for Net Gamma
+        if not ticker_chain.empty:
+            # Calculate daily net gamma
+            daily_gamma = ticker_chain.groupby('date_str').apply(
+                lambda x: (x['gamma'] * x['open_interest'] * 100 * np.where(x['side']=='CALL', 1, -1)).sum()
+            ).rename('net_gamma').reset_index()
+            merged_df = merged_df.merge(daily_gamma, on='date_str', how='left')
+        else:
+            merged_df['net_gamma'] = np.nan
+
+        # Fill NAs with forward fill for missing options data on some days
+        merged_df.ffill(inplace=True)
+        
+        # Base Metrics calculation
+        merged_df['ShortVolPct_10d_MA'] = merged_df['ShortVolPct'].rolling(window=10).mean()
+        merged_df['ShortVolPct_30d_MA'] = merged_df['ShortVolPct'].rolling(window=30).mean()
+        merged_df['Price_10d_MA'] = merged_df['close'].rolling(window=10).mean()
+        merged_df['PCR_10d_MA'] = merged_df['put_call_ratio_vol'].rolling(window=10).mean()
+        
+        # Forward Return Calculations
+        # Note: shift(-X) looks X rows ahead in the dataframe (future returns)
+        merged_df['t+3_return'] = merged_df['close'].shift(-3) / merged_df['close'] - 1
+        merged_df['t+5_return'] = merged_df['close'].shift(-5) / merged_df['close'] - 1
+        merged_df['t+10_return'] = merged_df['close'].shift(-10) / merged_df['close'] - 1
+
+        # Z-Score Calculation (90 day rolling)
+        merged_df['ShortVolPct_90d_mean'] = merged_df['ShortVolPct'].rolling(window=90).mean()
+        merged_df['ShortVolPct_90d_std'] = merged_df['ShortVolPct'].rolling(window=90).std()
+        merged_df['Z_Score'] = (merged_df['ShortVolPct'] - merged_df['ShortVolPct_90d_mean']) / merged_df['ShortVolPct_90d_std']
+
+        # ADVANCED MODELS CALCULATIONS
+        # 2A: MM Hedging Divergence
+        merged_df['MM_Hedging_Flag'] = (merged_df['ShortVolPct'] > merged_df['ShortVolPct_30d_MA']) & \
+                                       (merged_df['put_call_ratio_vol'] < 0.8) & \
+                                       (merged_df['close'] > merged_df['Price_10d_MA'])
+        
+        # 3B: Z-Score MACD
+        merged_df['Z_Score_EMA5'] = merged_df['Z_Score'].ewm(span=5, adjust=False).mean()
+        merged_df['Z_Score_EMA10'] = merged_df['Z_Score'].ewm(span=10, adjust=False).mean()
+        
+        # 4: Buy Ratio & Hidden Accumulation
+        merged_df['Implied_Long_Vol'] = merged_df['TotalVolume'] - merged_df['ShortVolume']
+        merged_df['Implied_Long_5d'] = merged_df['Implied_Long_Vol'].rolling(window=5).sum()
+        merged_df['ShortVol_5d'] = merged_df['ShortVolume'].rolling(window=5).sum()
+        merged_df['Buy_Ratio_5d'] = merged_df['Implied_Long_5d'] / merged_df['ShortVol_5d'].replace(0, np.nan)
+        merged_df['Buy_Ratio_30d_MA'] = merged_df['Buy_Ratio_5d'].rolling(window=30).mean()
+
+        st.divider()
+
+        # ==========================================
+        # MODEL 1: SHORT VOLUME SQUEEZE SCORE (SVSS)
+        # ==========================================
+        st.subheader("🔥 Model 1: Short Volume Squeeze Score (SVSS)")
+        st.markdown("Identifies setups where heavy shorting is fighting strong upward momentum, indicating shorts may be trapped.")
+        
+        latest = merged_df.iloc[-1]
+        
+        # Calculate SVSS Logic
+        svss_score = 0
+        if latest['ShortVolPct'] > latest['ShortVolPct_30d_MA']: svss_score += 30
+        if latest['ShortVolPct'] > 0.50: svss_score += 20
+        if latest['close'] > latest['Price_10d_MA']: svss_score += 30
+        if latest['put_call_ratio_vol'] < 1.0: svss_score += 20
+        
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("SVSS Score", f"{svss_score}/100", delta="High Risk" if svss_score > 70 else "Low Risk", delta_color="inverse" if svss_score > 70 else "normal")
+        c2.metric("Short Vol vs 30d MA", f"{latest['ShortVolPct']*100:.1f}%", f"{(latest['ShortVolPct'] - latest['ShortVolPct_30d_MA'])*100:+.1f}%")
+        c3.metric("Price vs 10d MA", f"${latest['close']:.2f}", f"${(latest['close'] - latest['Price_10d_MA']):+.2f}")
+        
+        # Display MM Hedging Divergence if true
+        if latest['MM_Hedging_Flag']:
+            c4.metric("Positioning Indicator", "MM Hedging (Bullish)", delta="Divergence Detected", delta_color="normal")
+        else:
+            c4.metric("Positioning Indicator", "Directional", delta="Standard", delta_color="off")
+
+        # DataFrame restricted to last 90 days for plotting Models
+        df_90d = merged_df.tail(90).copy()
+
+        # ==========================================
+        # MODEL 2: OPTIONS DIVERGENCE INDICATOR (ODI)
+        # ==========================================
+        st.divider()
+        st.subheader("⚖️ Model 2: Options Divergence Indicator (ODI)")
+        st.markdown("Compares off-exchange shorting against options market sentiment over the last 90 days. Divergences can signal market maker hedging or 'dumb money' being trapped.")
+        
+        from plotly.subplots import make_subplots
+        
+        fig_odi = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3], specs=[[{"secondary_y": True}], [{"secondary_y": False}]])
+        
+        fig_odi.add_trace(go.Scatter(x=df_90d['Date'], y=df_90d['ShortVolPct_10d_MA'], name='10d MA Short Vol %', line=dict(color='#EF553B', width=2)), row=1, col=1, secondary_y=False)
+        fig_odi.add_trace(go.Scatter(x=df_90d['Date'], y=df_90d['PCR_10d_MA'], name='10d MA P/C Ratio', line=dict(color='#00CC96', width=2)), row=1, col=1, secondary_y=True)
+        
+        fig_odi.add_trace(go.Scatter(x=df_90d['Date'], y=df_90d['close'], name='Spot Price', line=dict(color='white', width=2)), row=2, col=1)
+        
+        fig_odi.update_layout(
+            template='plotly_dark',
+            hovermode='x unified',
+            height=500,
+            margin=dict(t=30, b=30, l=10, r=10),
+            legend=dict(orientation="h", y=-0.1, x=0.5, xanchor="center")
+        )
+        fig_odi.update_xaxes(
+            rangebreaks=[
+                dict(bounds=["sat", "mon"]), # hide weekends
+                dict(values=MARKET_HOLIDAYS) # hide holidays
+            ]
+        )
+        fig_odi.update_yaxes(title_text="Short Volume %", tickformat='.1%', secondary_y=False, row=1, col=1)
+        fig_odi.update_yaxes(title_text="Put/Call Ratio", secondary_y=True, row=1, col=1)
+        fig_odi.update_yaxes(title_text="Spot Price", row=2, col=1)
+        
+        st.plotly_chart(fig_odi, use_container_width=True)
+
+        # ==========================================
+        # MODEL 3A: CAPITULATION Z-SCORE
+        # ==========================================
+        st.divider()
+        st.subheader("📊 Model 3A: Capitulation Z-Score")
+        st.markdown("Identifies statistical extremes in short selling over the last 90 days. A massive spike > 2.5 SDs is often the final wave of selling (capitulation) before a reversal.")
+        
+        fig_z = make_subplots(specs=[[{"secondary_y": True}]])
+        
+        fig_z.add_trace(go.Bar(
+            x=df_90d['Date'], 
+            y=df_90d['Z_Score'], 
+            name='Daily Z-Score',
+            marker_color=np.where(df_90d['Z_Score'] > 2.5, '#EF553B', np.where(df_90d['Z_Score'] < -2.5, '#00CC96', '#636EFA'))
+        ), secondary_y=False)
+        
+        fig_z.add_trace(go.Scatter(
+            x=df_90d['Date'], 
+            y=df_90d['close'], 
+            name='Spot Price',
+            line=dict(color='white', width=2)
+        ), secondary_y=True)
+        
+        fig_z.add_hline(y=2.5, line_dash="dash", line_color="#EF553B", annotation_text="+2.5 SD", secondary_y=False)
+        fig_z.add_hline(y=-2.5, line_dash="dash", line_color="#00CC96", annotation_text="-2.5 SD", secondary_y=False)
+        
+        fig_z.update_layout(
+            template='plotly_dark',
+            hovermode='x unified',
+            height=350,
+            margin=dict(t=30, b=30, l=10, r=10),
+            legend=dict(orientation="h", y=-0.1, x=0.5, xanchor="center")
+        )
+        fig_z.update_xaxes(
+            rangebreaks=[
+                dict(bounds=["sat", "mon"]),
+                dict(values=MARKET_HOLIDAYS)
+            ]
+        )
+        fig_z.update_yaxes(title_text="Z-Score (90d window)", secondary_y=False)
+        fig_z.update_yaxes(title_text="Spot Price", secondary_y=True)
+        st.plotly_chart(fig_z, use_container_width=True)
+
+        # ==========================================
+        # MODEL 3B: Z-SCORE EXHAUSTION & MOMENTUM
+        # ==========================================
+        st.subheader("⏱️ Model 3B: Short Selling Momentum")
+        st.markdown("Tracks the *momentum* of the short selling Z-Score. \n- **MACD Lines**: When the Fast (Yellow) line crosses below the Slow (Purple) line, short selling momentum is fading.")
+        
+        fig_z2 = make_subplots(specs=[[{"secondary_y": True}]])
+        
+        # Add Z-Score MACD lines
+        fig_z2.add_trace(go.Scatter(x=df_90d['Date'], y=df_90d['Z_Score_EMA5'], name='Z-Score Fast (5d)', line=dict(color='yellow', width=2)), secondary_y=False)
+        fig_z2.add_trace(go.Scatter(x=df_90d['Date'], y=df_90d['Z_Score_EMA10'], name='Z-Score Slow (10d)', line=dict(color='purple', width=2)), secondary_y=False)
+        
+        fig_z2.add_trace(go.Scatter(
+            x=df_90d['Date'], 
+            y=df_90d['close'], 
+            name='Spot Price',
+            line=dict(color='white', width=2, dash='dot')
+        ), secondary_y=True)
+        
+        fig_z2.update_layout(
+            template='plotly_dark',
+            hovermode='x unified',
+            height=350,
+            margin=dict(t=30, b=30, l=10, r=10),
+            legend=dict(orientation="h", y=-0.1, x=0.5, xanchor="center")
+        )
+        fig_z2.update_xaxes(
+            rangebreaks=[
+                dict(bounds=["sat", "mon"]),
+                dict(values=MARKET_HOLIDAYS)
+            ]
+        )
+        fig_z2.update_yaxes(title_text="Z-Score Momentum", secondary_y=False)
+        fig_z2.update_yaxes(title_text="Spot Price", secondary_y=True)
+        st.plotly_chart(fig_z2, use_container_width=True)
+
+        # ==========================================
+        # MODEL 4: GAMMA-AMPLIFIED SQUEEZE RISK
+        # ==========================================
+        st.divider()
+        st.subheader("💥 Model 4: Gamma-Amplified Squeeze Risk")
+        st.markdown("Short covering has an amplified impact when Market Makers are in **Negative Gamma** territory. Points are colored by their **T+5 Return**.")
+        
+        # Filter for the last 60 days to make the scatter plot relevant to recent action
+        recent_df = merged_df.tail(60).dropna(subset=['net_gamma', 'ShortVolPct']).copy()
+        
+        if not recent_df.empty:
+            fig_scatter = go.Figure()
+            
+            # Add quadrants
+            avg_short = recent_df['ShortVolPct'].mean()
+            
+            fig_scatter.add_vline(x=avg_short, line_dash="dash", line_color="white", opacity=0.3)
+            fig_scatter.add_hline(y=0, line_dash="dash", line_color="white", opacity=0.3)
+            
+            # Format returns for hover text (some might be NaN for the last few days)
+            def format_hover(row):
+                d = row['Date'].strftime('%Y-%m-%d')
+                s = f"{row['ShortVolPct']:.1%}"
+                g = f"{row['net_gamma']:,.0f}"
+                t3 = f"{row.get('t+3_return', 0):+.2%}" if not pd.isna(row.get('t+3_return')) else "N/A"
+                t5 = f"{row.get('t+5_return', 0):+.2%}" if not pd.isna(row.get('t+5_return')) else "N/A"
+                t10 = f"{row.get('t+10_return', 0):+.2%}" if not pd.isna(row.get('t+10_return')) else "N/A"
+                return f"<b>Date:</b> {d}<br><b>Short Vol:</b> {s}<br><b>Net Gamma:</b> {g}<br><br><b>T+3 Return:</b> {t3}<br><b>T+5 Return:</b> {t5}<br><b>T+10 Return:</b> {t10}"
+            
+            recent_df['hover_text'] = recent_df.apply(format_hover, axis=1)
+            
+            fig_scatter.add_trace(go.Scatter(
+                x=recent_df['ShortVolPct'], 
+                y=recent_df['net_gamma'],
+                mode='markers',
+                marker=dict(
+                    size=12,
+                    color=recent_df['t+5_return'].fillna(0),
+                    colorscale=[[0, '#EF553B'], [0.5, '#636EFA'], [1, '#00CC96']], # Red -> Blue -> Green
+                    cmid=0, # Center color scale on 0 return
+                    showscale=True,
+                    colorbar=dict(title="T+5 Return", tickformat='.1%'),
+                    line=dict(color='white', width=1)
+                ),
+                text=recent_df['hover_text'],
+                hovertemplate="%{text}<extra></extra>"
+            ))
+            
+            # Highlight latest point
+            if not pd.isna(latest['net_gamma']):
+                fig_scatter.add_trace(go.Scatter(
+                    x=[latest['ShortVolPct']],
+                    y=[latest['net_gamma']],
+                    mode='markers',
+                    marker=dict(size=18, color='yellow', symbol='star'),
+                    name='Latest Day',
+                    hovertemplate="<b>Latest Day</b><extra></extra>"
+                ))
+            
+            fig_scatter.add_annotation(x=recent_df['ShortVolPct'].max(), y=min(0, recent_df['net_gamma'].min()), text="🚨 DANGER ZONE 🚨", showarrow=False, font=dict(color="#EF553B", size=14))
+            
+            fig_scatter.update_layout(
+                template='plotly_dark',
+                xaxis_title="Short Volume %",
+                xaxis_tickformat='.1%',
+                yaxis_title="Total Net Gamma Exposure",
+                height=500,
+                showlegend=False,
+                margin=dict(t=30, b=30, l=10, r=10)
+            )
+            st.plotly_chart(fig_scatter, use_container_width=True)
+        else:
+            st.info("Insufficient options gamma data to calculate the Gamma-Amplified Squeeze Risk.")
+
+        # ==========================================
+        # MODEL 5: 5-DAY BUY RATIO & HIDDEN ACCUMULATION
+        # ==========================================
+        st.divider()
+        st.subheader("📈 Model 5: 5-Day Buy Ratio & Hidden Accumulation")
+        st.markdown("Compares the rolling 5-day implied long volume to short volume. A ratio > 1 implies net buying. Spikes on red days highlight hidden institutional accumulation.")
+        
+        fig_buy = make_subplots(specs=[[{"secondary_y": True}]])
+        
+        # Color bars green if accumulation (Buy_Ratio_5d > Buy_Ratio_30d_MA), red if distribution
+        colors = np.where(df_90d['Buy_Ratio_5d'] > df_90d['Buy_Ratio_30d_MA'], '#00CC96', '#EF553B')
+        
+        fig_buy.add_trace(go.Bar(
+            x=df_90d['Date'], 
+            y=df_90d['Buy_Ratio_5d'], 
+            name='5-Day Buy Ratio',
+            marker_color=colors
+        ), secondary_y=False)
+        
+        fig_buy.add_trace(go.Scatter(
+            x=df_90d['Date'], 
+            y=df_90d['Buy_Ratio_30d_MA'], 
+            name='30-Day Avg Ratio',
+            line=dict(color='yellow', width=2, dash='dot')
+        ), secondary_y=False)
+        
+        fig_buy.add_trace(go.Scatter(
+            x=df_90d['Date'], 
+            y=df_90d['close'], 
+            name='Spot Price',
+            line=dict(color='white', width=2)
+        ), secondary_y=True)
+        
+        fig_buy.add_hline(y=1.0, line_dash="dash", line_color="white", annotation_text="Net Neutral (1.0)", secondary_y=False)
+        
+        fig_buy.update_layout(
+            template='plotly_dark',
+            hovermode='x unified',
+            height=400,
+            margin=dict(t=30, b=30, l=10, r=10),
+            legend=dict(orientation="h", y=-0.1, x=0.5, xanchor="center")
+        )
+        fig_buy.update_xaxes(
+            rangebreaks=[
+                dict(bounds=["sat", "mon"]), # hide weekends
+                dict(values=MARKET_HOLIDAYS) # hide holidays
+            ]
+        )
+        fig_buy.update_yaxes(title_text="Buy / Short Ratio", secondary_y=False)
+        fig_buy.update_yaxes(title_text="Spot Price", secondary_y=True)
+        st.plotly_chart(fig_buy, use_container_width=True)
